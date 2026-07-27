@@ -13,11 +13,9 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
-# Avoid creating scripts/__pycache__ during early imports before output_dir/tmp
-# is known. configure_python_pycache() re-enables bytecode under tmp/pycache.
-sys.dont_write_bytecode = True
-
 import yaml
+
+sys.dont_write_bytecode = True
 
 # 本文件固定放在 project/scripts/run_body_mesh.py
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -33,6 +31,7 @@ SCRIPT_EXTRACT_ROT = CONVERT_TO_EGO_DIR / "extract_hawor_to_vggt_rotation.py"
 SCRIPT_04_BUILD_HAMER = CONVERT_TO_EGO_DIR / "04_build_egoallo_hamer_from_hawor_world.py"
 SCRIPT_ESTIMATE_MOGE_SCALE = CONVERT_TO_EGO_DIR / "04_estimate_moge_metric_scale.py"
 SCRIPT_05_APPLY_SCALE = CONVERT_TO_EGO_DIR / "05_apply_metric_scale.py"
+SCRIPT_05B_RESAMPLE = CONVERT_TO_EGO_DIR / "05b_resample_egoallo_inputs.py"
 
 SCRIPT_RUN_GEOCALIB = ESMATEG_DIR / "run_geocalib.py"
 SCRIPT_ESTIMATE_GRAVITY = ESMATEG_DIR / "01_estimate_gravity_da3_geocalib.py"
@@ -217,26 +216,20 @@ def cleanup_existing_scripts_pycache(enabled: bool) -> dict[str, Any]:
 
 
 def configure_python_pycache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: Path) -> tuple[Path | None, dict[str, Any]]:
-    """Redirect Python bytecode cache away from the source tree.
-
-    PYTHONPYCACHEPREFIX is read by each child Python process at startup. Setting
-    sys.pycache_prefix here also keeps any later imports in the coordinator from
-    writing __pycache__ directories under scripts/.
-    """
     cleanup_result = cleanup_existing_scripts_pycache(
         _cfg_bool(get_cfg(cfg, "python_cache.cleanup_existing_scripts_pycache", True), default=True)
     )
     enabled = _cfg_bool(get_cfg(cfg, "python_cache.redirect_pycache_to_tmp", True), default=True)
     if not enabled:
         env.pop("PYTHONPYCACHEPREFIX", None)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         return None, cleanup_result
 
     cache_subdir = str(get_cfg(cfg, "python_cache.pycache_subdir", "pycache"))
     cache_dir = (tmp_dir / cache_subdir).expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
     env["PYTHONPYCACHEPREFIX"] = str(cache_dir)
-    sys.pycache_prefix = str(cache_dir)
-    sys.dont_write_bytecode = False
     print(f"[Python] pycache redirected to: {cache_dir}", flush=True)
     return cache_dir, cleanup_result
 
@@ -259,7 +252,7 @@ def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tm
         get_cfg(
             cfg,
             "jax_guidance.compilation_cache.cache_subdir",
-            "jax_compilation_cache",
+            "jax_worker_cache",
         )
     )
     cache_dir = (tmp_dir / cache_subdir).expanduser().resolve()
@@ -287,6 +280,9 @@ def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tm
     if _cfg_bool(get_cfg(cfg, "jax_guidance.compilation_cache.debug_log_modules", False)):
         env["JAX_DEBUG_LOG_MODULES"] = "jax._src.compiler,jax._src.lru_cache"
         env["JAX_LOGGING_LEVEL"] = "DEBUG"
+
+    # Export to both env keys for legacy import paths in EgoAllo code.
+    env["EGOALLO_JAX_COMPILATION_CACHE_DIR"] = str(cache_dir)
 
     print(f"[JAX] Persistent compilation cache enabled: {cache_dir}", flush=True)
     return cache_dir
@@ -336,6 +332,7 @@ class PipelineRunRecorder:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+
 
 
 def run(cmd: list[str], *, cwd: Path = PROJECT_ROOT, env: dict[str, str] | None = None) -> None:
@@ -407,6 +404,7 @@ def main() -> None:
         (SCRIPT_EXTRACT_ROT, "extract_hawor_to_vggt_rotation.py"),
         (SCRIPT_04_BUILD_HAMER, "04_build_egoallo_hamer_from_hawor_world.py"),
         (SCRIPT_05_APPLY_SCALE, "05_apply_metric_scale.py"),
+        (SCRIPT_05B_RESAMPLE, "05b_resample_egoallo_inputs.py"),
         (SCRIPT_RUN_GEOCALIB, "run_geocalib.py"),
         (SCRIPT_ESTIMATE_GRAVITY, "01_estimate_gravity_da3_geocalib.py"),
         (SCRIPT_APPLY_ALIGNMENT, "02_apply_alignment_da3_geocalib.py"),
@@ -424,9 +422,6 @@ def main() -> None:
     output_dir = args.output_dir.expanduser().resolve()
 
     require_dir(frames_dir, "frames_dir")
-    require_dir(cam_space_dir, "cam_space_dir")
-    require_file(hawor_hands_vggt_world, "hawor_hands_vggt_world")
-    require_file(hawor_to_vggt_alignment, "hawor_to_vggt_alignment")
     require_file(vggt_head_pose, "vggt_head_pose")
     require_file(scene_points_ply, "scene_points_ply")
 
@@ -482,6 +477,7 @@ def main() -> None:
     stable_hands_jsonl = tmp_dir / "hawor_hands_for_egoallo_world_stable.jsonl"
     R_hawor_to_vggt_npy = tmp_dir / "R_hawor_to_vggt.npy"
     hamer_outputs_pkl_tmp = tmp_dir / "hamer_outputs.pkl"
+    empty_hawor_hands_vggt_world = tmp_dir / "empty_hawor_hands_vggt_world.jsonl"
 
     geocalib_gravity_npz = tmp_dir / "geocalib_gravity.npz"
     R_align_npy = tmp_dir / "R_align.npy"
@@ -512,11 +508,29 @@ def main() -> None:
         "--intrinsics-path", str(intrinsics_txt),
     ], env=env)
 
+    if hawor_hands_vggt_world.is_file():
+        hands_jsonl_for_pipeline = hawor_hands_vggt_world
+    else:
+        empty_hawor_hands_vggt_world.write_text("", encoding="utf-8")
+        hands_jsonl_for_pipeline = empty_hawor_hands_vggt_world
+        print(
+            f"[HaWoR] No hand JSONL found at {hawor_hands_vggt_world}; "
+            f"using empty hand detections: {empty_hawor_hands_vggt_world}",
+            flush=True,
+        )
+
+    if not cam_space_dir.is_dir():
+        print(
+            f"[HaWoR] cam_space_dir not found: {cam_space_dir}; "
+            "continuing without MANO cam_space records.",
+            flush=True,
+        )
+
     # 02: HaWoR world hands -> EgoAllo prepared hands
     cmd = [
         py,
         str(SCRIPT_02_EXTRACT_HANDS),
-        "--hands-jsonl", str(hawor_hands_vggt_world),
+        "--hands-jsonl", str(hands_jsonl_for_pipeline),
         "--timestamps-txt", str(timestamps_txt),
         "--output-jsonl", str(prepared_hands_jsonl),
         "--soft-start-frames", str(get_cfg(cfg, "hawor_extract.soft_start_frames", 15)),
@@ -554,12 +568,14 @@ def main() -> None:
         "--duplicate-mode", str(get_cfg(cfg, "hawor_stabilize.duplicate_mode", "drop_both")),
     ], env=env)
 
-    # HaWoR -> VGGT rotation
+    # HaWoR -> VGGT rotation. If no hands were detected upstream, the alignment
+    # file may be absent; use identity so the empty-hand path can still finish.
     run([
         py,
         str(SCRIPT_EXTRACT_ROT),
         "--alignment-json", str(hawor_to_vggt_alignment),
         "--output-npy", str(R_hawor_to_vggt_npy),
+        "--missing-is-identity",
     ], env=env)
 
     # 04: build EgoAllo hamer pkl from HaWoR world hands
@@ -833,7 +849,7 @@ def main() -> None:
             "--height-fallback-max-scale", str(get_cfg(cfg, "metric_scale.height_fallback.max_scale", 20.0)),
             "--height-fallback-smooth-window", str(get_cfg(cfg, "metric_scale.height_fallback.smooth_window", 1)),
 
-            "--hands-vggt-jsonl-for-scale", str(hawor_hands_vggt_world),
+            "--hands-vggt-jsonl-for-scale", str(hands_jsonl_for_pipeline),
             "--R-align-for-scale", str(R_align_npy),
             "--align-meta-for-scale", str(alignment_transform_npz),
         ]
@@ -849,7 +865,7 @@ def main() -> None:
                 "--frontend-head-jsonl-name", str(get_cfg(cfg, "metric_scale.frontend.head_jsonl_name", "head_trajectory_egoallo.jsonl")),
                 "--frontend-hands-jsonl-name", str(get_cfg(cfg, "metric_scale.frontend.hands_jsonl_name", "hand_keypoints_egoallo.jsonl")),
                 "--timestamps-txt", str(timestamps_txt),
-                "--hands-vggt-jsonl-in", str(hawor_hands_vggt_world),
+                "--hands-vggt-jsonl-in", str(hands_jsonl_for_pipeline),
                 "--R-align", str(R_align_npy),
                 "--align-meta", str(alignment_transform_npz),
             ])
@@ -908,31 +924,43 @@ def main() -> None:
             "--output_voxel_size", str(get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01)),
         ], env=env)
 
+    # Optional temporal resampling: usually from sparse (~5 FPS) to target FPS (default 30 FPS).
+    # Keep this stage in the main pipeline and controlled by temporal_resampling.* in body_mesh.yaml.
+    run([
+        py,
+        str(SCRIPT_05B_RESAMPLE),
+        "--head-trajectory", str(head_trajectory_out),
+        "--timestamps-txt", str(timestamps_txt),
+        "--hamer-pkl", str(hamer_outputs_pkl_out),
+        "--config", str(args.config.expanduser().resolve()),
+        "--tmp-dir", str(tmp_dir),
+        "--output-dir", str(output_dir),
+    ], env=env)
+
     # EgoAllo：不再使用 demo/sequence_name，直接使用 output_dir 下的目录。
     # 05_run_egoallo_from_head.py 的可选参数统一由 YAML 的 egoallo 段控制，
     # 这里写入环境变量，再由 05_run_egoallo.sh 转成命令行参数。
     env["EGOALLO_GUIDANCE_MODE"] = str(get_cfg(cfg, "egoallo.guidance_mode", "hamer_wrist"))
     env["EGOALLO_GUIDANCE_INNER"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_inner", True)) else "0"
     env["EGOALLO_GUIDANCE_POST"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_post", True)) else "0"
-
+    env["EGOALLO_TARGET_SEGMENT_LENGTH"] = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
     env["EGOALLO_CONTEXT_FRAMES"] = str(get_cfg(cfg, "egoallo.context_frames", 0))
     env["EGOALLO_SAVE_ONLY_CENTER"] = "1" if bool(get_cfg(cfg, "egoallo.save_only_center", True)) else "0"
-
     env["EGOALLO_GLASSES_X_ANGLE_OFFSET"] = str(get_cfg(cfg, "egoallo.glasses_x_angle_offset", 0.0))
     env["EGOALLO_START_INDEX"] = str(get_cfg(cfg, "egoallo.start_index", 0))
     env["EGOALLO_SEGMENT_INDEX_OFFSET"] = str(get_cfg(cfg, "egoallo.segment_index_offset", 0))
     env["EGOALLO_NUM_SAMPLES"] = str(get_cfg(cfg, "egoallo.num_samples", 1))
     env["EGOALLO_FLOOR_Z"] = str(get_cfg(cfg, "egoallo.floor_z", 0.0))
-
     env["EGOALLO_SAVE_TRAJ"] = "1" if bool(get_cfg(cfg, "egoallo.save_traj", True)) else "0"
     env["EGOALLO_SAVE_ARGS"] = "1" if bool(get_cfg(cfg, "egoallo.save_args", True)) else "0"
     env["EGOALLO_EMPTY_CACHE_EACH_SEGMENT"] = "1" if bool(get_cfg(cfg, "egoallo.empty_cache_each_segment", False)) else "0"
     env["EGOALLO_ALLOW_TF32"] = "1" if bool(get_cfg(cfg, "egoallo.allow_tf32", False)) else "0"
-
     env["EGOALLO_EXPECTED_HEAD_HEIGHT_MIN"] = str(get_cfg(cfg, "egoallo.expected_head_height_min", 1.0))
     env["EGOALLO_EXPECTED_HEAD_HEIGHT_MAX"] = str(get_cfg(cfg, "egoallo.expected_head_height_max", 2.2))
     env["EGOALLO_EGO_CONFIG_PATH"] = str(args.config.expanduser().resolve())
     env["EGOALLO_JAX_CACHE_LOG"] = str(tmp_dir / "jax_cache_hits.log")
+    if bool(get_cfg(cfg, "egoallo.disable_dlpack", False)):
+        env["EGOALLO_DISABLE_DLPACK"] = "1"
 
     end_index = get_cfg(cfg, "egoallo.end_index", None)
     if end_index is not None:
@@ -940,14 +968,7 @@ def main() -> None:
     else:
         env.pop("EGOALLO_END_INDEX", None)
 
-    if bool(get_cfg(cfg, "egoallo.disable_dlpack", False)):
-        env["EGOALLO_DISABLE_DLPACK"] = "1"
-
     segment_length = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
-    # EgoAllo 分段输出目录：只保存每段中心裁剪后的 .npz / _args.yaml，不和最终结果目录混在一起。
-    # 05_run_egoallo_from_head.py 会按照 EGOALLO_CONTEXT_FRAMES 做重叠推理 + 中间裁剪。
-    # 06_smooth_egoallo_segments.py 现在作为 merge-only 脚本，从 ego_tmp_dir 读取分段文件，
-    # 再把合并后的 merged_smoothed_vis.npz 写入 egoallo_outputs_dir。
     run([
         "bash",
         str(SCRIPT_RUN_EGOALLO),
@@ -1089,7 +1110,6 @@ def main() -> None:
         summary["cleanup"] = cleanup_results
 
     print("\nBodyMesh pipeline completed.", flush=True)
-    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
 
 if __name__ == "__main__":

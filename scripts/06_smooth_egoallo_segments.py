@@ -438,6 +438,20 @@ def boundary_quality(out: dict[str, np.ndarray], boundaries: list[int]) -> list[
     return reports
 
 
+def infer_fps_from_timestamps_ns(timestamps_ns: np.ndarray) -> float | None:
+    ts = np.asarray(timestamps_ns, dtype=np.float64).reshape(-1)
+    if ts.size < 2:
+        return None
+    dts = np.diff(ts)
+    if np.any(dts <= 0):
+        return None
+    dts_sec = dts / 1e9
+    median_dt = float(np.median(dts_sec))
+    if median_dt <= 0.0:
+        return None
+    return float(1.0 / median_dt)
+
+
 def print_report(segment_info, continuity, boundary_reports):
     print("Loaded segments:")
     for info in segment_info:
@@ -506,6 +520,13 @@ def main():
     out["merge_boundary_blend_frames"] = np.asarray(int(args.boundary_blend_frames), dtype=np.int64)
     out["merge_translation_smooth_window"] = np.asarray(int(args.translation_smooth_window), dtype=np.int64)
     out["merge_quat_lowpass_alpha"] = np.asarray(float(args.quat_lowpass_alpha), dtype=np.float32)
+
+    if "timestamps_ns" in out:
+        timestamps_ns = np.asarray(out["timestamps_ns"], dtype=np.int64).reshape(-1)
+        out["timestamps"] = timestamps_ns.astype(np.float64) / 1e9
+        fps = infer_fps_from_timestamps_ns(timestamps_ns)
+        if fps is not None:
+            out["fps"] = np.asarray(float(fps), dtype=np.float32)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / args.output_name

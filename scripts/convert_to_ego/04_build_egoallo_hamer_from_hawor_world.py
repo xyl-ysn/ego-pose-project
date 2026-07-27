@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import sys
+
 import argparse
 import json
 import pickle
 import re
-import sys
 import warnings
 from pathlib import Path
 
@@ -420,7 +421,8 @@ def load_cam_space_dirs(left_dir, right_dir, frame_key):
             continue
         directory = Path(directory)
         if not directory.exists():
-            raise FileNotFoundError(directory)
+            print(f"[HaWoR] cam_space {side} dir not found; skipping MANO records: {directory}")
+            continue
         for path in sorted(directory.glob("*.json")):
             for rec in load_cam_space_json(path, side, frame_key):
                 frame_id = rec.get(frame_key, rec.get("_filename_frame_id", rec.get("frame_id")))

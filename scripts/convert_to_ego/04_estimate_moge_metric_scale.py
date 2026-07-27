@@ -18,15 +18,15 @@ default, so the main pipeline can fall back to hand-based scale or no scale.
 Use --strict to turn failures into non-zero exit codes.
 """
 from __future__ import annotations
+import os
+import sys
 
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 import re
 import shutil
-import sys
 import time
 import traceback
 from typing import Any

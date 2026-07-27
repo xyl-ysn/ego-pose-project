@@ -77,7 +77,7 @@ config: &body_mesh_config
     egoallo_model_config_path: third_party/egoallo/egoallo_checkpoint_april13/model_config.yaml
     egoallo_model_npz: third_party/egoallo/data/smplh/neutral/model.npz
 
-    geocalib_pinhole_tar: /home/xieyongling/.cache/torch/hub/geocalib/pinhole.tar
+    geocalib_pinhole_tar: third_party/GeoCalib/weigths/pinhole.tar
 
     mano_left_pkl: model/MANO_LEFT.pkl
     mano_right_pkl: model/MANO_RIGHT.pkl
@@ -172,7 +172,7 @@ config: &body_mesh_config
     # 最终写出 final_scene.ply 时做一次降采样。0 表示不降采样。
     # 02_apply_alignment_da3_geocalib.py 现在默认只输出 head_trajectory.npy，不再写中间 aligned_scene.ply。
     #点云降采样
-    final_scene_output_voxel_size: 0.003
+    final_scene_output_voxel_size: 0
 
     # 尺度估计优先级：
     # 1. 手骨架
@@ -295,12 +295,12 @@ config: &body_mesh_config
         - name: wrist_middle_mcp
           i: 0
           j: 9
-          length_m: 0.095
+          length_m: 0.115
 
         - name: index_pinky_mcp
           i: 5
           j: 17
-          length_m: 0.075
+          length_m: 0.088
 
     # 第三 fallback：找疑似直立阶段的头部高度，而不是全段 median
     height_fallback:
@@ -328,6 +328,51 @@ config: &body_mesh_config
       head_jsonl_name: head_trajectory_egoallo.jsonl
       hands_jsonl_name: hand_keypoints_egoallo.jsonl
 
+  temporal_resampling:
+    # 在 05_apply_metric_scale.py 与 05_run_egoallo.sh 之间执行。
+    enabled: true
+    stage: after_metric_scale
+
+    head:
+      translation_method: pchip
+      rotation_method: slerp
+      max_interpolation_gap_sec: 0.40
+      preserve_observed_values: true
+
+    hands:
+      enabled: true
+      interpolation:
+        max_interpolation_gap_sec: 0.30
+        geometry_generation: mano_forward
+        translation_method: pchip
+        split_on_track_id_change: true
+        split_on_handedness_change: true
+        max_wrist_speed_mps: 4.0
+        max_global_angular_speed_deg_s: 150.0
+        max_palm_bone_change_ratio: 0.15
+        max_beta_difference: 2.0
+        interpolated_constraint_scale: 0.35
+        pose_confidence_scale: 1.0
+        interpolated_visualization_scale: 1.0
+        gap_tau_sec: 0.30
+        interp_midpoint_penalty_strength: 0.50
+        apply_gap_decay: true
+        apply_motion_decay: true
+        do_extrapolate: false
+        mano_missing_fallback: missing
+        beta_scope: per_sequence_per_side
+
+    validation:
+      timestamp_tolerance_sec: 0.005
+      max_wrist_speed_mps: 4.0
+      max_wrist_rotation_deg: 150.0
+      fail_on_large_head_gap: true
+
+    output:
+      backup_sparse_inputs: true
+      metadata_file: tmp/temporal_resampling_metadata.json
+      mapping_file: tmp/temporal_resampling_map.jsonl
+
   egoallo:
     # EgoAllo 分段推理参数：
     # - target_segment_length 是每段最终保存的帧数。
@@ -339,7 +384,7 @@ config: &body_mesh_config
     target_segment_length: 512
 
     # 每段推理时额外看前后多少帧。数值越大，边界上下文越多，但显存估算也越高。
-    context_frames: 20
+    context_frames: 32
 
     # 只保存中间目标段，不保存上下文重叠部分
     save_only_center: true
@@ -427,6 +472,7 @@ config: &body_mesh_config
 
       denoiser:
         compile_model: false
+
   smooth:
     enabled: true
 
@@ -435,7 +481,7 @@ config: &body_mesh_config
     boundary_blend_frames: 36
 
     # root translation 滑窗平滑。0/1 表示关闭；偶数会自动提升为下一个奇数。
-    translation_smooth_window: 15
+    translation_smooth_window: 0
 
     # 旋转低通平滑。0 表示关闭。
     # 建议先试 0.15；如果仍抖，试 0.20~0.30。

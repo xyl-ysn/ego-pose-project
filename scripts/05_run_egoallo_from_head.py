@@ -562,6 +562,23 @@ def _coerce_guidance_bucket_t(
     return _coerce_int(value, 0)
 
 
+def block_until_ready(tree: Any) -> Any:
+    if tree is None:
+        return tree
+    if hasattr(tree, "block_until_ready"):
+        return tree.block_until_ready()
+
+    try:
+        jax_tree_fn = getattr(jax, "tree", None)
+        if hasattr(jax_tree_fn, "map"):
+            return jax.tree.map(block_until_ready, tree)
+        if hasattr(jax, "tree_map"):
+            return jax.tree_map(block_until_ready, tree)
+    except Exception:
+        pass
+    return tree
+
+
 def _build_effective_ego_config_view(
     ego_config: dict[str, Any],
     target_segment_length: int = 0,
@@ -771,6 +788,294 @@ def _slice_time_numpy(x: np.ndarray, start: int, end: int, infer_len: int) -> np
         return x[start:end, ...]
     return x
 
+
+@dataclasses.dataclass
+class EgoAlloRuntime:
+    args: Args
+    device: torch.device
+    T_world_head: torch.Tensor
+    pose_timesteps: torch.Tensor
+    T_world_cpf_all: torch.Tensor
+    runtime_report_path: Path
+    checkpoint_dir: Path
+    smplh_npz_path: Path
+    ego_config: dict[str, Any]
+    cfg: SimpleNamespace
+    denoiser_network: Any
+    body_model: Any
+    guidance_runtime: GuidanceRuntime | None
+    all_hamer: CorrespondedHamerDetections | None
+    tasks: list[SegmentTask]
+
+
+def create_egoallo_runtime(args: Args) -> EgoAlloRuntime:
+    if args.traj_length <= 0:
+        raise ValueError(f"traj_length must be positive, got {args.traj_length}")
+    if args.context_frames < 0:
+        raise ValueError(f"context_frames must be >= 0, got {args.context_frames}")
+
+    device = torch.device("cuda")
+    torch.set_grad_enabled(False)
+    torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
+
+    T_world_head, pose_timesteps, _ = load_custom_transforms(args.traj_root, device)
+    num_poses = T_world_head.shape[0]
+    max_output_frames = num_poses - 1
+    if args.start_index < 0 or args.start_index >= max_output_frames:
+        raise ValueError(f"start_index must be in [0, {max_output_frames - 1}], got {args.start_index}")
+    final_end = max_output_frames if args.end_index is None else min(args.end_index, max_output_frames)
+    if final_end <= args.start_index:
+        raise ValueError(f"end_index must be > start_index, got {final_end} <= {args.start_index}")
+
+    tasks, final_end_for_log = build_segment_tasks(args, max_output_frames)
+    print(f"{T_world_head.shape=}")
+    print(f"total output frames={max_output_frames}, run range=[{args.start_index}, {final_end_for_log})")
+    print(f"target segment length={args.traj_length}")
+    print(f"context frames={args.context_frames}, save_only_center={args.save_only_center}")
+
+    T_camera_cpf = torch.from_numpy(T_CAMERA_CPF).to(device)
+    T_world_cpf_all = T_world_head @ T_camera_cpf
+    print_head_height_stats_once(
+        T_world_cpf_all,
+        floor_z=args.floor_z,
+        expected_min=args.expected_head_height_min,
+        expected_max=args.expected_head_height_max,
+    )
+
+    checkpoint_dir = _normalize_checkpoint_dir(args.checkpoint_dir)
+    if checkpoint_dir is None:
+        raise ValueError("EgoAllo checkpoint is required. Set EGOALLO_CHECKPOINT_DIR or pass --checkpoint-dir.")
+    model_config_path = args.model_config_path
+    if model_config_path is None:
+        model_config_path = EGOALLO_MODEL_CONFIG_PATH
+
+    if args.smplh_npz_path is None:
+        raise ValueError("SMPL-H model is required. Set SMPLH_NPZ_PATH/EGOALLO_MODEL_NPZ or pass --smplh-npz-path.")
+    smplh_npz_path = Path(args.smplh_npz_path).expanduser().resolve()
+    if not smplh_npz_path.is_file():
+        raise FileNotFoundError(f"SMPL-H model not found: {smplh_npz_path}")
+
+    ego_config = load_ego_config(args.ego_config_path)
+    cfg = _build_effective_ego_config_view(
+        ego_config,
+        target_segment_length=args.traj_length,
+        context_frames=args.context_frames,
+    )
+
+    output_root = args.output_dir if args.output_dir is not None else args.traj_root / "ego_tmp"
+    runtime_report_path = _write_ego_runtime_report(output_root, args, args.ego_config_path, ego_config, cfg)
+
+    print("\n[Load denoiser/body model once]")
+    compile_model_cfg = bool(ego_config["denoiser"].get("compile_model", False))
+    denoiser_network = load_denoiser_with_config(
+        checkpoint_dir,
+        model_config_path,
+        compile_model=bool(args.ego_compile_model) or compile_model_cfg,
+    ).to(device).eval()
+    body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
+
+    inner_max_iters = _coerce_optional_int(cfg.constraint_optimization.inner_max_iters)
+    post_max_iters = _coerce_optional_int(cfg.constraint_optimization.post_max_iters)
+    build_guidance_runtime = (
+        bool(cfg.constraint_optimization.enabled)
+        and args.guidance_mode != "off"
+        and (
+            bool(args.guidance_inner)
+            and (inner_max_iters is None or inner_max_iters > 0)
+            or bool(args.guidance_post)
+            and (post_max_iters is None or post_max_iters > 0)
+        )
+    )
+    guidance_runtime = GuidanceRuntime(body_model) if build_guidance_runtime else None
+
+    if args.hamer_outputs_path is not None:
+        if not args.hamer_outputs_path.is_file():
+            raise FileNotFoundError(args.hamer_outputs_path)
+        if args.guidance_mode == "no_hands":
+            raise ValueError("--hamer-outputs-path was provided, but --guidance-mode=no-hands would ignore it.")
+        print("\n[Load HaMeR detections once on CPU]")
+        pose_timesteps_np = pose_timesteps.detach().cpu().numpy()
+        all_pose_ts = tuple(float(x) for x in pose_timesteps_np[1:])
+        all_hamer = CorrespondedHamerDetections.load(args.hamer_outputs_path, all_pose_ts)
+    else:
+        if args.guidance_mode in ("hamer_wrist", "hamer_reproj2", "aria_hamer"):
+            raise ValueError(f"--guidance-mode={args.guidance_mode} requires --hamer-outputs-path.")
+        all_hamer = None
+        print("No HaMeR/HaWoR detections provided.")
+
+    return EgoAlloRuntime(
+        args=args,
+        device=device,
+        T_world_head=T_world_head,
+        pose_timesteps=pose_timesteps,
+        T_world_cpf_all=T_world_cpf_all,
+        runtime_report_path=runtime_report_path,
+        checkpoint_dir=checkpoint_dir,
+        smplh_npz_path=smplh_npz_path,
+        ego_config=ego_config,
+        cfg=cfg,
+        denoiser_network=denoiser_network,
+        body_model=body_model,
+        guidance_runtime=guidance_runtime,
+        all_hamer=all_hamer,
+        tasks=tasks,
+    )
+
+
+def run_egoallo_segments(
+    runtime: EgoAlloRuntime,
+    *,
+    task_indices: tuple[int, int] | None = None,
+    override_args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    args = dataclasses.replace(runtime.args)
+    if override_args:
+        for key, value in override_args.items():
+            setattr(args, key, value)
+
+    segment_indices = runtime.tasks
+    if task_indices is not None:
+        lo, hi = task_indices
+        segment_indices = [task for task in runtime.tasks if lo <= task.segment_index < hi]
+
+    start_t = time.time()
+    for task in segment_indices:
+        target_start = task.target_start
+        target_end = task.target_end
+        target_length = task.target_length
+        infer_start = task.infer_start
+        infer_end = task.infer_end
+        infer_length = task.infer_length
+        crop_offset = task.crop_offset
+        segment_index = task.segment_index
+        print("\n========================================")
+        print(
+            f"Segment {segment_index} | target={target_start}-{target_end} "
+            f"target_length={target_length} | infer={infer_start}-{infer_end} "
+            f"infer_length={infer_length} crop_offset={crop_offset}"
+        )
+        print("========================================")
+
+        T_world_cpf_window = runtime.T_world_cpf_all[infer_start : infer_start + infer_length + 1]
+        Ts_world_cpf = (
+            SE3.from_matrix(T_world_cpf_window)
+            @ SE3.from_rotation(SO3.from_x_radians(runtime.T_world_head.new_tensor(args.glasses_x_angle_offset)))
+        ).parameters()
+        pose_timestamps_sec = runtime.pose_timesteps[infer_start + 1 : infer_start + infer_length + 1]
+
+        hamer_detections = None
+        if args.hamer_outputs_path is not None:
+            hamer_detections = maybe_slice_hamer(
+                runtime.all_hamer,
+                args.hamer_outputs_path,
+                runtime.pose_timesteps,
+                infer_start,
+                infer_length,
+                runtime.device,
+            )
+
+        with torch.inference_mode():
+            cfg = runtime.cfg
+            sampling_kwargs = {
+                "body_model": runtime.body_model,
+                "guidance_mode": args.guidance_mode,
+                "guidance_inner": args.guidance_inner,
+                "guidance_post": args.guidance_post,
+                "Ts_world_cpf": Ts_world_cpf,
+                "hamer_detections": hamer_detections,
+                "aria_detections": None,
+                "num_samples": args.num_samples,
+                "device": runtime.device,
+                "floor_z": args.floor_z,
+                "guidance_verbose": False,
+                "jax_body_model": None if runtime.guidance_runtime is None else runtime.guidance_runtime.jax_body_model,
+            }
+            sampling_kwargs.update(
+                {
+                    "num_steps": int(cfg.sampling.num_steps),
+                    "schedule": str(runtime.ego_config.get("sampling", {}).get("schedule", "quadratic")),
+                    "window_size": int(cfg.sampling.window_size),
+                    "overlap_size": int(cfg.sampling.overlap_size),
+                    "keep_intermediate_states": bool(cfg.sampling.keep_intermediate_states),
+                    "guidance_inner_max_iters": _coerce_optional_int(cfg.constraint_optimization.inner_max_iters),
+                    "guidance_post_max_iters": _coerce_optional_int(cfg.constraint_optimization.post_max_iters),
+                    "constraint_optimization_enabled": bool(cfg.constraint_optimization.enabled),
+                    "constraint_optimization_inner_last_steps": _coerce_int(cfg.constraint_optimization.inner_last_steps, 0),
+                    "constraint_optimization_inner_step_frequency": _coerce_int(cfg.constraint_optimization.inner_step_frequency, 1),
+                    "constraint_optimization_post_last_steps": _coerce_int(cfg.constraint_optimization.post_last_steps, 0),
+                    "constraint_optimization_post_step_frequency": _coerce_int(cfg.constraint_optimization.post_step_frequency, 1),
+                    "constraint_optimization_post_timing_repeat": 0,
+                    "constraint_optimization_bucket_t": _coerce_int(cfg.constraint_optimization.bucket_t, 0),
+                    "constraint_optimization_detection_bucket": _coerce_int(cfg.constraint_optimization.detection_bucket, 0),
+                    "constraint_optimization_warmup_before_segments": bool(cfg.constraint_optimization.warmup_before_segments),
+                    "constraint_optimization_enable_hand_constraints": bool(cfg.constraint_optimization.enable_hand_constraints),
+                    "constraint_optimization_enable_foot_constraints": bool(cfg.constraint_optimization.enable_foot_constraints),
+                    "constraint_optimization_enable_collision_constraints": bool(cfg.constraint_optimization.enable_collision_constraints),
+                    "constraint_optimization_enable_body_regularization": bool(cfg.constraint_optimization.enable_body_regularization),
+                    "guidance_inner_repeat": _coerce_optional_int(cfg.guidance.inner_repeat),
+                    "guidance_post_repeat": _coerce_optional_int(cfg.guidance.post_repeat),
+                    "guidance_early_stop_grad_norm": _coerce_optional_float(cfg.guidance.early_stop_grad_norm),
+                    "return_timing": False,
+                }
+            )
+            supported_sampling_params = set(inspect.signature(run_sampling_with_stitching).parameters.keys())
+            sampling_kwargs = {key: value for key, value in sampling_kwargs.items() if key in supported_sampling_params}
+            sampled = run_sampling_with_stitching(runtime.denoiser_network, **sampling_kwargs)
+            block_until_ready(sampled)
+
+            if isinstance(sampled, tuple):
+                traj, _stage_timing = sampled
+            else:
+                traj = sampled
+
+        save_segment(
+            args,
+            traj,
+            runtime.body_model,
+            Ts_world_cpf,
+            pose_timestamps_sec,
+            infer_start,
+            infer_length,
+            target_start,
+            target_length,
+            crop_offset,
+            segment_index,
+        )
+
+        del traj, hamer_detections
+        if args.empty_cache_each_segment:
+            torch.cuda.empty_cache()
+
+    return {
+        "status": "done",
+        "segments": len(segment_indices),
+        "elapsed_sec": round(time.time() - start_t, 3),
+    }
+
+
+def warmup_egoallo_runtime(runtime: EgoAlloRuntime) -> dict[str, Any]:
+    if not runtime.tasks:
+        return {
+            "status": "done",
+            "segments": 0,
+            "bucket_t": int(runtime.cfg.constraint_optimization.bucket_t),
+            "detection_bucket": int(runtime.cfg.constraint_optimization.detection_bucket),
+        }
+
+    first_index = int(runtime.args.segment_index_offset)
+    warmup_result = run_egoallo_segments(
+        runtime,
+        task_indices=(first_index, first_index + 1),
+        override_args={"save_traj": False, "save_args": False},
+    )
+    return {
+        "status": "done",
+        "segments": warmup_result["segments"],
+        "bucket_t": int(runtime.cfg.constraint_optimization.bucket_t),
+        "detection_bucket": int(runtime.cfg.constraint_optimization.detection_bucket),
+    }
+
 def save_segment(
     args: Args,
     traj,
@@ -870,265 +1175,8 @@ def save_segment(
 
 
 def main(args: Args) -> None:
-    if args.traj_length <= 0:
-        raise ValueError(f"traj_length must be positive, got {args.traj_length}")
-    if args.context_frames < 0:
-        raise ValueError(f"context_frames must be >= 0, got {args.context_frames}")
-
-    device = torch.device("cuda")
-    torch.set_grad_enabled(False)
-    torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
-    torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
-
-    # Load once for all segments.
-    T_world_head, pose_timesteps, timestamps_np = load_custom_transforms(args.traj_root, device)
-    num_poses = T_world_head.shape[0]
-    max_output_frames = num_poses - 1
-
-    if args.start_index < 0 or args.start_index >= max_output_frames:
-        raise ValueError(f"start_index must be in [0, {max_output_frames - 1}], got {args.start_index}")
-
-    final_end = max_output_frames if args.end_index is None else min(args.end_index, max_output_frames)
-    if final_end <= args.start_index:
-        raise ValueError(f"end_index must be > start_index, got {final_end} <= {args.start_index}")
-
-    tasks, final_end_for_log = build_segment_tasks(args, max_output_frames)
-
-    print(f"{T_world_head.shape=}")
-    print(f"total output frames={max_output_frames}, run range=[{args.start_index}, {final_end_for_log})")
-    print(f"target segment length={args.traj_length}")
-    print(f"context frames={args.context_frames}, save_only_center={args.save_only_center}")
-
-    T_camera_cpf = torch.from_numpy(T_CAMERA_CPF).to(device)
-    T_world_cpf_all = T_world_head @ T_camera_cpf
-    print_head_height_stats_once(
-        T_world_cpf_all,
-        floor_z=args.floor_z,
-        expected_min=args.expected_head_height_min,
-        expected_max=args.expected_head_height_max,
-    )
-
-    checkpoint_dir = _normalize_checkpoint_dir(args.checkpoint_dir)
-    if checkpoint_dir is None:
-        raise ValueError("EgoAllo checkpoint is required. Set EGOALLO_CHECKPOINT_DIR or pass --checkpoint-dir.")
-    model_config_path = args.model_config_path
-    if model_config_path is None:
-        model_config_path = EGOALLO_MODEL_CONFIG_PATH
-
-    if args.smplh_npz_path is None:
-        raise ValueError("SMPL-H model is required. Set SMPLH_NPZ_PATH/EGOALLO_MODEL_NPZ or pass --smplh-npz-path.")
-    smplh_npz_path = Path(args.smplh_npz_path).expanduser().resolve()
-    if not smplh_npz_path.is_file():
-        raise FileNotFoundError(f"SMPL-H model not found: {smplh_npz_path}")
-
-    ego_config = load_ego_config(args.ego_config_path)
-    cfg = _build_effective_ego_config_view(
-        ego_config,
-        target_segment_length=args.traj_length,
-        context_frames=args.context_frames,
-    )
-    output_root = args.output_dir if args.output_dir is not None else args.traj_root / "ego_tmp"
-    runtime_report_path = _write_ego_runtime_report(
-        output_root, args, args.ego_config_path, ego_config, cfg
-    )
-
-    print("\n[Load denoiser/body model once]")
-    compile_model_cfg = bool(ego_config["denoiser"].get("compile_model", False))
-    denoiser_network = load_denoiser_with_config(
-        checkpoint_dir,
-        model_config_path,
-        compile_model=bool(args.ego_compile_model) or compile_model_cfg,
-    ).to(device).eval()
-    body_model = fncsmpl.SmplhModel.load(smplh_npz_path).to(device)
-
-    inner_max_iters = _coerce_optional_int(cfg.constraint_optimization.inner_max_iters)
-    post_max_iters = _coerce_optional_int(cfg.constraint_optimization.post_max_iters)
-    build_guidance_runtime = (
-        bool(cfg.constraint_optimization.enabled)
-        and args.guidance_mode != "off"
-        and (
-            bool(args.guidance_inner)
-            and (inner_max_iters is None or inner_max_iters > 0)
-            or bool(args.guidance_post)
-            and (post_max_iters is None or post_max_iters > 0)
-        )
-    )
-    guidance_runtime = None
-    if build_guidance_runtime:
-        guidance_runtime = GuidanceRuntime(body_model)
-
-    if args.hamer_outputs_path is not None:
-        if not args.hamer_outputs_path.is_file():
-            raise FileNotFoundError(args.hamer_outputs_path)
-        if args.guidance_mode == "no_hands":
-            raise ValueError("--hamer-outputs-path was provided, but --guidance-mode=no-hands would ignore it.")
-        print("\n[Load HaMeR detections once on CPU]")
-        # Use the same float32 timestamp path as the original per-segment script.
-        # This avoids subtle timestamp matching differences for detections keyed by time.
-        pose_timesteps_np = pose_timesteps.detach().cpu().numpy()
-        all_pose_ts = tuple(float(x) for x in pose_timesteps_np[1:])
-        all_hamer = CorrespondedHamerDetections.load(args.hamer_outputs_path, all_pose_ts)
-    else:
-        if args.guidance_mode in ("hamer_wrist", "hamer_reproj2", "aria_hamer"):
-            raise ValueError(f"--guidance-mode={args.guidance_mode} requires --hamer-outputs-path.")
-        all_hamer = None
-        print("No HaMeR/HaWoR detections provided.")
-
-    aria_detections = None
-
-    for task in tasks:
-        target_start = task.target_start
-        target_end = task.target_end
-        target_length = task.target_length
-        infer_start = task.infer_start
-        infer_end = task.infer_end
-        infer_length = task.infer_length
-        crop_offset = task.crop_offset
-        segment_index = task.segment_index
-        print("\n========================================")
-        print(
-            f"Segment {segment_index} | target={target_start}-{target_end} "
-            f"target_length={target_length} | infer={infer_start}-{infer_end} "
-            f"infer_length={infer_length} crop_offset={crop_offset}"
-        )
-        print("========================================")
-
-        T_world_cpf_window = T_world_cpf_all[infer_start : infer_start + infer_length + 1]
-        Ts_world_cpf = (
-            SE3.from_matrix(T_world_cpf_window)
-            @ SE3.from_rotation(SO3.from_x_radians(T_world_head.new_tensor(args.glasses_x_angle_offset)))
-        ).parameters()
-        pose_timestamps_sec = pose_timesteps[infer_start + 1 : infer_start + infer_length + 1]
-
-        hamer_detections = None
-        if args.hamer_outputs_path is not None:
-            hamer_detections = maybe_slice_hamer(
-                all_hamer,
-                args.hamer_outputs_path,
-                pose_timesteps,
-                infer_start,
-                infer_length,
-                device,
-            )
-
-        with torch.inference_mode():
-            with timer("prepare"):
-                sampling_kwargs = {
-                    "body_model": body_model,
-                    "guidance_mode": args.guidance_mode,
-                    "guidance_inner": args.guidance_inner,
-                    "guidance_post": args.guidance_post,
-                    "Ts_world_cpf": Ts_world_cpf,
-                    "hamer_detections": hamer_detections,
-                    "aria_detections": aria_detections,
-                    "num_samples": args.num_samples,
-                    "device": device,
-                    "floor_z": args.floor_z,
-                    "guidance_verbose": False,
-                    "jax_body_model": None
-                    if guidance_runtime is None
-                    else guidance_runtime.jax_body_model,
-                }
-                # Optional sampling config fields supported by newer versions.
-                sampling_kwargs.update(
-                    {
-                        "num_steps": int(cfg.sampling.num_steps),
-                        "schedule": str(
-                            ego_config.get("sampling", {}).get("schedule", "quadratic")
-                        ),
-                        "window_size": int(cfg.sampling.window_size),
-                        "overlap_size": int(cfg.sampling.overlap_size),
-                        "keep_intermediate_states": bool(
-                            cfg.sampling.keep_intermediate_states
-                        ),
-                        "guidance_inner_max_iters": inner_max_iters,
-                        "guidance_post_max_iters": post_max_iters,
-                        "constraint_optimization_enabled": bool(
-                            cfg.constraint_optimization.enabled
-                        ),
-                        "constraint_optimization_inner_last_steps": _coerce_int(
-                            cfg.constraint_optimization.inner_last_steps, 0
-                        ),
-                        "constraint_optimization_inner_step_frequency": _coerce_int(
-                            cfg.constraint_optimization.inner_step_frequency, 1
-                        ),
-                        "constraint_optimization_post_last_steps": _coerce_int(
-                            cfg.constraint_optimization.post_last_steps, 0
-                        ),
-                        "constraint_optimization_post_step_frequency": _coerce_int(
-                            cfg.constraint_optimization.post_step_frequency, 1
-                        ),
-                        "constraint_optimization_post_timing_repeat": 0,
-                        "constraint_optimization_bucket_t": _coerce_int(
-                            cfg.constraint_optimization.bucket_t, 0
-                        ),
-                        "constraint_optimization_detection_bucket": _coerce_int(
-                            cfg.constraint_optimization.detection_bucket, 0
-                        ),
-                        "constraint_optimization_warmup_before_segments": bool(
-                            cfg.constraint_optimization.warmup_before_segments
-                        ),
-                        "constraint_optimization_enable_hand_constraints": bool(
-                            cfg.constraint_optimization.enable_hand_constraints
-                        ),
-                        "constraint_optimization_enable_foot_constraints": bool(
-                            cfg.constraint_optimization.enable_foot_constraints
-                        ),
-                        "constraint_optimization_enable_collision_constraints": bool(
-                            cfg.constraint_optimization.enable_collision_constraints
-                        ),
-                        "constraint_optimization_enable_body_regularization": bool(
-                            cfg.constraint_optimization.enable_body_regularization
-                        ),
-                        "guidance_inner_repeat": _coerce_optional_int(
-                            cfg.guidance.inner_repeat
-                        ),
-                        "guidance_post_repeat": _coerce_optional_int(
-                            cfg.guidance.post_repeat
-                        ),
-                        "guidance_early_stop_grad_norm": _coerce_optional_float(
-                            cfg.guidance.early_stop_grad_norm
-                        ),
-                        "return_timing": False,
-                    }
-                )
-                supported_sampling_params = set(
-                    inspect.signature(run_sampling_with_stitching).parameters.keys()
-                )
-                sampling_kwargs = {
-                    key: value for key, value in sampling_kwargs.items() if key in supported_sampling_params
-                }
-
-            with timer("sampling"):
-                sampled = run_sampling_with_stitching(denoiser_network, **sampling_kwargs)
-
-            if isinstance(sampled, tuple):
-                traj, stage_timing = sampled
-            else:
-                traj, stage_timing = sampled, None
-
-            with timer("post_guidance"):
-                pass
-
-        with timer("save"):
-            save_segment(
-                args,
-                traj,
-                body_model,
-                Ts_world_cpf,
-                pose_timestamps_sec,
-                infer_start,
-                infer_length,
-                target_start,
-                target_length,
-                crop_offset,
-                segment_index,
-            )
-
-        del traj, hamer_detections
-        if args.empty_cache_each_segment:
-            torch.cuda.empty_cache()
-
+    runtime = create_egoallo_runtime(args)
+    run_egoallo_segments(runtime)
     print("\nDone.")
 
 

@@ -738,14 +738,18 @@ def cap_hand_scale_by_head_p90(
     if scaled_p90 <= max_p90:
         return float(scale), info
 
+    info.update({
+        "capped_by_head_p90": True,
+        "scaled_height_p90_after_cap": float(max_p90),
+    })
+
     capped_scale = max_p90 / float(original_p90)
     info.update({
         "scale": float(capped_scale),
-        "capped_by_head_p90": True,
-        "scaled_height_p90_after_cap": float(max_p90),
         "head_p90_cap_warning": (
-            f"hand scale capped from {float(scale):.9f} to {float(capped_scale):.9f} "
-            f"because scaled p90 head height {scaled_p90:.6f}m exceeds {max_p90:.6f}m"
+            f"hand-fallback head cap applied: "
+            f"scaled p90 head height {scaled_p90:.6f}m exceeds {max_p90:.6f}m, "
+            f"scale changed {float(scale):.9f} -> {float(capped_scale):.9f}."
         ),
     })
     return float(capped_scale), info
@@ -814,6 +818,227 @@ def relative_mad(values: np.ndarray, center: float | None = None) -> float:
     med = float(np.median(values)) if center is None else float(center)
     denom = max(abs(med), 1e-8)
     return float(np.median(np.abs(values - med)) / denom)
+
+
+def _pick_hand_side(hand: dict) -> str | None:
+    side = str(hand.get("side", "")).strip().lower()
+    return side if side in ("left", "right") else None
+
+
+def _pick_hand_keypoints(hand: dict) -> tuple[np.ndarray | None, str | None]:
+    # Priority: explicit hand frame keypoints -> world -> camera variants.
+    # Existing hand JSONL may only contain world/camera fields; keep a fallback
+    # path for compatibility.
+    for key in ("keypoints_3d", "world_keypoints_3d", "camera_keypoints_3d", "hawor_camera_keypoints_3d"):
+        if key not in hand:
+            continue
+        arr = np.asarray(hand[key], dtype=np.float64)
+        if arr.ndim == 3 and arr.shape[0] == 1 and arr.shape[2] == 3:
+            arr = arr[0]
+        if arr.ndim == 1 and arr.size > 0 and arr.shape[0] % 3 == 0:
+            arr = arr.reshape(-1, 3)
+        if arr.ndim != 2 or arr.shape[1] != 3:
+            return None, key
+        return arr, key
+    return None, None
+
+
+def _filter_bones_to_palm(
+    bones: list[dict],
+    kps: np.ndarray,
+) -> list[dict]:
+    # Keep wrist + 4 MCP indices commonly used by HaWoR: 0,5,9,13,17.
+    allowed = {0, 5, 9, 13, 17}
+    if kps.shape[0] <= max(allowed):
+        return []
+    out = []
+    for bone in bones:
+        i = int(bone["i"])
+        j = int(bone["j"])
+        if i in allowed and j in allowed:
+            out.append({
+                "name": bone["name"],
+                "i": i,
+                "j": j,
+                "length_m": float(bone["length_m"]),
+            })
+    return out
+
+
+def _iter_hands_by_side(
+    hands_jsonl: Path,
+    *,
+    r_align: Path,
+    align_meta: Path,
+) -> tuple[list[tuple[float, np.ndarray, float, str, int, int]], list[tuple[float, np.ndarray, float, str, int, int]], int, int, list[str], list[str]]:
+    """
+    Parse hand JSONL and return per-side candidate lists and summary stats.
+    Returned lists are tuples of (timestamp, keypoints, confidence, source, line_no, hand_index).
+    """
+    R_final, t_floor = load_vggt_to_egoallo_transform(Path(r_align), Path(align_meta))
+    hands: dict[str, list[tuple[float, np.ndarray, float, str, int, int]]] = {
+        "left": [],
+        "right": [],
+    }
+    total_frames = 0
+    total_hands = 0
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    with Path(hands_jsonl).expanduser().resolve().open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            total_frames += 1
+            try:
+                rec = json.loads(line)
+            except Exception as exc:
+                errors.append(f"line{line_no}: json_error={exc!r}")
+                continue
+
+            ts = record_timestamp(rec, float(line_no))
+            hands_in_frame = rec.get("hands", [])
+            if not isinstance(hands_in_frame, list):
+                continue
+
+            # Keep one detection per hand side in each source frame; pick the
+            # highest-confidence one so each side contributes at most one scale
+            # sample per frame.
+            per_frame_best: dict[str, tuple[float, np.ndarray, float, str, int, int] | None] = {
+                "left": None,
+                "right": None,
+            }
+
+            for hand_idx, hand in enumerate(hands_in_frame):
+                if not isinstance(hand, dict):
+                    continue
+                side = _pick_hand_side(hand)
+                if side is None:
+                    continue
+
+                hand_kps, used_key = _pick_hand_keypoints(hand)
+                if hand_kps is None:
+                    warnings.append(f"line{line_no}: hand{hand_idx} side={side}:missing/invalid keypoints")
+                    continue
+                if not np.isfinite(hand_kps).all():
+                    warnings.append(f"line{line_no}: hand{hand_idx} side={side}:hand_keypoints_contains_nan_or_inf")
+                    continue
+
+                hand_kps = transform_vggt_world_to_egoallo(hand_kps, R_final, t_floor)
+                conf = hand_confidence(hand)
+                if conf is None or not np.isfinite(conf):
+                    conf = 1.0
+                else:
+                    conf = float(conf)
+
+                current = per_frame_best[side]
+                if current is None or float(conf) > float(current[2]):
+                    per_frame_best[side] = (float(ts), hand_kps, float(conf), used_key, int(line_no), int(hand_idx))
+                total_hands += 1
+
+            for side, chosen in per_frame_best.items():
+                if chosen is not None:
+                    hands[side].append(chosen)
+
+    return hands["left"], hands["right"], total_frames, total_hands, warnings, errors
+
+
+def _estimate_scale_from_bone_set(
+    hand_kps: np.ndarray,
+    bones: list[dict],
+    min_scale: float,
+    max_scale: float,
+    max_relative_mad: float,
+    min_valid_bones: int,
+) -> tuple[float | None, dict]:
+    # Each frame contributes one scale; reject bad frames by bone ratio stability.
+    per_bone_scales: list[float] = []
+    per_bone_meta: dict[str, float] = {}
+    for bone in bones:
+        i, j, target_len = int(bone["i"]), int(bone["j"]), float(bone["length_m"])
+        if i < 0 or j < 0 or i >= len(hand_kps) or j >= len(hand_kps):
+            continue
+        if target_len <= 0:
+            continue
+        observed = float(np.linalg.norm(hand_kps[i] - hand_kps[j]))
+        if not np.isfinite(observed) or observed <= 1e-8:
+            continue
+        scale = target_len / observed
+        if not np.isfinite(scale) or scale < min_scale or scale > max_scale:
+            continue
+        per_bone_scales.append(float(scale))
+        per_bone_meta[f"{bone.get('name', f'{i}_{j}')}_scale"] = float(scale)
+
+    arr = np.asarray(per_bone_scales, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < int(max(1, min_valid_bones)):
+        return None, {
+            "status": "invalid",
+            "num_valid_bones": int(arr.size),
+            "reason": "not_enough_bones_in_frame",
+            "per_bone": per_bone_meta,
+        }
+
+    frame_scale = float(np.median(arr))
+    rel = relative_mad(arr, frame_scale)
+    if rel > float(max_relative_mad):
+        return None, {
+            "status": "invalid",
+            "num_valid_bones": int(arr.size),
+            "relative_mad": float(rel),
+            "reason": "frame_relative_mad_too_large",
+            "per_bone": per_bone_meta,
+            "frame_scale": frame_scale,
+        }
+
+    return frame_scale, {
+        "status": "ok",
+        "num_valid_bones": int(arr.size),
+        "relative_mad": float(rel),
+        "frame_scale": float(frame_scale),
+        "per_bone": per_bone_meta,
+        "bone_scales_median": float(frame_scale),
+        "bone_scales": [float(x) for x in arr.tolist()],
+    }
+
+
+def _collect_hand_scale_samples(
+    side_records: list[tuple[float, np.ndarray, float, str, int, int]],
+    *,
+    bones: list[dict],
+    min_scale: float,
+    max_scale: float,
+    max_relative_mad: float,
+    min_valid_bones: int,
+) -> tuple[list[tuple[float, float, float]], dict[str, int], list[dict]]:
+    frame_scales: list[tuple[float, float, float]] = []
+    per_bone_per_scale: list[dict] = []
+    summary = {"frame_total": 0, "frame_valid": 0}
+    for ts, hand_kps, conf, used_key, _line_no, _hand_idx in side_records:
+        summary["frame_total"] += 1
+        if used_key is None:
+            continue
+        frame_bones = _filter_bones_to_palm(bones, hand_kps)
+        if not frame_bones:
+            continue
+        frame_min_bones = max(1, min(int(min_valid_bones), len(frame_bones)))
+        frame_scale, scale_meta = _estimate_scale_from_bone_set(
+            hand_kps=hand_kps,
+            bones=frame_bones,
+            min_scale=float(min_scale),
+            max_scale=float(max_scale),
+            max_relative_mad=float(max_relative_mad),
+            min_valid_bones=int(frame_min_bones),
+        )
+        if frame_scale is None:
+            continue
+        summary["frame_valid"] += 1
+        if conf is None or not np.isfinite(conf):
+            conf = 1.0
+        frame_scales.append((float(ts), float(frame_scale), float(conf)))
+        per_bone_per_scale.append(scale_meta)
+    return frame_scales, summary, per_bone_per_scale
 
 
 def _finite_head_heights(head_poses: np.ndarray, floor_z: float) -> np.ndarray:
@@ -1081,86 +1306,114 @@ def try_hand_scale(
             info["reason"] = "no_valid_hand_bones_config"
             return None, info
 
-        R_final, t_floor = load_vggt_to_egoallo_transform(Path(r_align), Path(align_meta))
-        scales: list[float] = []
-        per_bone: dict[str, list[float]] = {b["name"]: [] for b in bones}
-        frames = 0
-        hands_count = 0
+        left_raw, right_raw, total_frames, total_hands, warnings, parse_errors = _iter_hands_by_side(
+            Path(hands_jsonl),
+            r_align=Path(r_align),
+            align_meta=Path(align_meta),
+        )
 
-        with Path(hands_jsonl).expanduser().resolve().open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                frames += 1
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                for hand in rec.get("hands", []):
-                    if "keypoints_3d" not in hand:
-                        continue
-                    kps = np.asarray(hand["keypoints_3d"], dtype=np.float64)
-                    if kps.ndim != 2 or kps.shape[1] != 3:
-                        continue
-                    if not np.isfinite(kps).all():
-                        continue
-                    kps = transform_vggt_world_to_egoallo(kps, R_final, t_floor)
-                    hands_count += 1
-                    for bone in bones:
-                        i, j, target_len = int(bone["i"]), int(bone["j"]), float(bone["length_m"])
-                        if i < 0 or j < 0 or i >= len(kps) or j >= len(kps) or target_len <= 0:
-                            continue
-                        observed = float(np.linalg.norm(kps[i] - kps[j]))
-                        if not np.isfinite(observed) or observed <= 1e-8:
-                            continue
-                        scale = target_len / observed
-                        if not np.isfinite(scale) or scale < min_scale or scale > max_scale:
-                            continue
-                        scales.append(float(scale))
-                        per_bone[bone["name"]].append(float(scale))
+        left_scales, left_summary, left_bone_meta = _collect_hand_scale_samples(
+            left_raw,
+            bones=bones,
+            min_scale=min_scale,
+            max_scale=max_scale,
+            max_relative_mad=max_relative_mad,
+            min_valid_bones=int(min_valid_bones),
+        )
+        right_scales, right_summary, right_bone_meta = _collect_hand_scale_samples(
+            right_raw,
+            bones=bones,
+            min_scale=min_scale,
+            max_scale=max_scale,
+            max_relative_mad=max_relative_mad,
+            min_valid_bones=int(min_valid_bones),
+        )
 
-        arr = np.asarray(scales, dtype=np.float64)
-        arr = arr[np.isfinite(arr)]
+        all_scales = left_scales + right_scales
+        if not all_scales:
+            info["status"] = "failed"
+            info["reason"] = "no_valid_frame_scale"
+            info["parse_warnings"] = warnings
+            info["parse_errors"] = parse_errors
+            info["frames"] = int(total_frames)
+            info["hands"] = int(total_hands)
+            info["left_frames_total"] = int(left_summary["frame_total"])
+            info["left_frames_valid"] = int(left_summary["frame_valid"])
+            info["right_frames_total"] = int(right_summary["frame_total"])
+            info["right_frames_valid"] = int(right_summary["frame_valid"])
+            info["per_bone_scale_meta"] = left_bone_meta + right_bone_meta
+            info["bones"] = bones
+            return None, info
+
+        if (len(all_scales) < int(max(1, min_valid_bones))):
+            info["status"] = "failed"
+            info["reason"] = "not_enough_valid_frames"
+            info["min_valid_bones"] = int(min_valid_bones)
+            info["valid_frames"] = int(len(all_scales))
+            info["parse_warnings"] = warnings
+            info["parse_errors"] = parse_errors
+            info["frames"] = int(total_frames)
+            info["hands"] = int(total_hands)
+            info["left_frames_total"] = int(left_summary["frame_total"])
+            info["left_frames_valid"] = int(left_summary["frame_valid"])
+            info["right_frames_total"] = int(right_summary["frame_total"])
+            info["right_frames_valid"] = int(right_summary["frame_valid"])
+            info["per_bone_scale_meta"] = left_bone_meta + right_bone_meta
+            return None, info
+
+        scales = np.asarray([x[1] for x in all_scales], dtype=np.float64)
+        scale = float(np.median(scales))
+        conf = float(np.mean([x[2] for x in all_scales], dtype=np.float64))
+        rel = relative_mad(scales, scale)
+
+        if rel > float(max_relative_mad):
+            info["status"] = "failed"
+            info["reason"] = "global_relative_mad_too_large"
+            info["scale"] = None
+            info["relative_mad"] = float(rel)
+            info["median_scale"] = float(scale)
+            info["min_valid_bones"] = int(min_valid_bones)
+            info["min_scale"] = float(min_scale)
+            info["max_scale"] = float(max_scale)
+            info["max_relative_mad"] = float(max_relative_mad)
+            info["parse_warnings"] = warnings
+            info["parse_errors"] = parse_errors
+            info["left_frames_total"] = int(left_summary["frame_total"])
+            info["left_frames_valid"] = int(left_summary["frame_valid"])
+            info["right_frames_total"] = int(right_summary["frame_total"])
+            info["right_frames_valid"] = int(right_summary["frame_valid"])
+            info["per_bone_scale_meta"] = left_bone_meta + right_bone_meta
+            return None, info
+
         info.update({
-            "frames": int(frames),
-            "hands": int(hands_count),
-            "num_candidates": int(arr.size),
+            "status": "ok",
+            "reason": "global_hand_scale_median",
+            "scale": float(scale),
+            "selected_scale": float(scale),
+            "confidence": float(conf),
+            "relative_mad": float(rel),
+            "num_valid_scales": int(scales.size),
             "min_valid_bones": int(min_valid_bones),
             "max_relative_mad": float(max_relative_mad),
             "min_scale": float(min_scale),
             "max_scale": float(max_scale),
+            "left_frames_total": int(left_summary["frame_total"]),
+            "left_frames_valid": int(left_summary["frame_valid"]),
+            "right_frames_total": int(right_summary["frame_total"]),
+            "right_frames_valid": int(right_summary["frame_valid"]),
+            "parse_warnings": warnings,
+            "parse_errors": parse_errors,
             "bones": bones,
-            "per_bone": {
-                name: {
-                    "count": len(vals),
-                    "median_scale": float(np.median(vals)) if vals else None,
-                }
-                for name, vals in per_bone.items()
-            },
+            "frames": int(total_frames),
+            "hands": int(total_hands),
+            "per_bone_scale_meta": left_bone_meta + right_bone_meta,
         })
+        return float(scale), info
 
-        if arr.size < int(min_valid_bones):
-            info["reason"] = "not_enough_valid_bones"
-            return None, info
-        scale = float(np.median(arr))
-        rel = relative_mad(arr, scale)
-        info["relative_mad"] = rel
-        if rel > float(max_relative_mad):
-            info["reason"] = "relative_mad_too_large"
-            info["scale"] = scale
-            return None, info
-        info.update({
-            "status": "ok",
-            "reason": "hand_bone_length_ratio",
-            "scale": scale,
-        })
-        return scale, info
     except Exception as exc:
         info["reason"] = "exception"
         info["exception"] = repr(exc)
         return None, info
-
 
 
 def _moving_average_1d(values: np.ndarray, window: int) -> np.ndarray:
@@ -1397,7 +1650,7 @@ def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -
                 "attempts": attempts,
                 "hands": info,
                 "hand_head_height_policy": "trust_hands_cap_high_p90",
-                "target_height": None if not info.get("capped_by_head_p90") else float(args.hand_max_p90_head_height),
+                "target_height": None,
                 "warning": info.get("head_p90_cap_warning"),
             })
             if info.get("head_p90_cap_warning"):

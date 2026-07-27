@@ -17,10 +17,11 @@ It deliberately does NOT interpolate missing hands by default. Interpolated hand
 have matching MANO params and can become placeholder MANO constraints in 03.
 """
 
+import sys
+
 import argparse
 import copy
 import json
-import sys
 from pathlib import Path
 
 import numpy as np

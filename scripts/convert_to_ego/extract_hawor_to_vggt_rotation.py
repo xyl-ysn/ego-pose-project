@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import sys
+
 import argparse
 import json
 from pathlib import Path
@@ -15,14 +17,23 @@ def main():
         default="depth_scale_report.sim3.R",
         help="Dot path to the 3x3 rotation. Default: depth_scale_report.sim3.R",
     )
+    ap.add_argument(
+        "--missing-is-identity",
+        action="store_true",
+        help="If --alignment-json is absent, write an identity rotation instead of failing.",
+    )
     args = ap.parse_args()
 
-    data = json.loads(args.alignment_json.read_text(encoding="utf-8"))
-    value = data
-    for key in args.json_key.split("."):
-        value = value[key]
+    if args.missing_is_identity and not args.alignment_json.is_file():
+        R = np.eye(3, dtype=np.float32)
+        print(f"[HaWoR] Alignment JSON not found: {args.alignment_json}; using identity rotation.")
+    else:
+        data = json.loads(args.alignment_json.read_text(encoding="utf-8"))
+        value = data
+        for key in args.json_key.split("."):
+            value = value[key]
+        R = np.asarray(value, dtype=np.float32)
 
-    R = np.asarray(value, dtype=np.float32)
     if R.shape != (3, 3):
         raise ValueError(f"Expected 3x3 rotation, got {R.shape}")
 

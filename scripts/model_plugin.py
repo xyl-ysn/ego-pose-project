@@ -12,6 +12,8 @@ import sys
 import time
 from typing import Any, Callable, Mapping, Optional, Protocol
 
+sys.dont_write_bytecode = True
+
 try:
     from zata_worker.contracts.types import TaskContext
 except Exception:  # pragma: no cover - local/offline fallback
@@ -390,10 +392,7 @@ def _resolve_keypoint_tool_inputs(keypoint_dir: Path) -> KeypointToolInputs:
     )
 
     _require_dir(inputs.frames_dir, "frames_dir")
-    _require_dir(inputs.cam_space_dir, "cam_space_dir")
     _require_dir(vggt_dir, "vggt_dir")
-    _require_file(inputs.hawor_hands_vggt_world, "hawor_hands_vggt_world")
-    _require_file(inputs.hawor_to_vggt_alignment, "hawor_to_vggt_alignment")
     _require_file(inputs.vggt_head_pose, "vggt_head_pose")
     _require_file(inputs.scene_points_ply, "scene_points_ply")
     return inputs

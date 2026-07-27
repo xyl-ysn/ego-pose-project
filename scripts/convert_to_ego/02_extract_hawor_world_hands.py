@@ -28,10 +28,11 @@ Important:
   in that case use --min-output-alpha or --trim-segment-edges to omit early frames.
 """
 
+import sys
+
 import argparse
 import copy
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
