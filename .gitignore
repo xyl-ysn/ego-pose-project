@@ -3,7 +3,7 @@ data/outputs/egoallo_inputs/*
 data/outputs/egoallo_outputs/*
 data/outputs/tmp/*
 data/outputs/thk/*
-data/outputs/body_mesh_thk/*
+jax_cache/*
 
 # 第三方库源码
 third_party/*

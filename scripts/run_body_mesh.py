@@ -37,6 +37,7 @@ SCRIPT_RUN_GEOCALIB = ESMATEG_DIR / "run_geocalib.py"
 SCRIPT_ESTIMATE_GRAVITY = ESMATEG_DIR / "01_estimate_gravity_da3_geocalib.py"
 SCRIPT_APPLY_ALIGNMENT = ESMATEG_DIR / "02_apply_alignment_da3_geocalib.py"
 
+SCRIPT_VALIDATE_POSE_BEFORE_EGOALLO = SCRIPTS_DIR / "05c_validate_pose_before_egoallo.py"
 SCRIPT_RUN_EGOALLO = SCRIPTS_DIR / "05_run_egoallo.sh"
 SCRIPT_SMOOTH_EGOALLO = SCRIPTS_DIR / "06_smooth_egoallo_segments.py"
 
@@ -234,13 +235,83 @@ def configure_python_pycache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: 
     return cache_dir, cleanup_result
 
 
-def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: Path) -> Path | None:
-    """Enable JAX persistent compilation cache under <output_dir>/tmp.
+def _jax_compilation_cache_signature(cfg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "egoallo": {
+            "target_segment_length": get_cfg(cfg, "egoallo.target_segment_length", 256),
+            "context_frames": get_cfg(cfg, "egoallo.context_frames", 0),
+            "guidance_mode": get_cfg(cfg, "egoallo.guidance_mode", "hamer_wrist"),
+            "guidance_inner": bool(get_cfg(cfg, "egoallo.guidance_inner", True)),
+            "guidance_post": bool(get_cfg(cfg, "egoallo.guidance_post", True)),
+            "num_samples": get_cfg(cfg, "egoallo.num_samples", 1),
+            "allow_tf32": bool(get_cfg(cfg, "egoallo.allow_tf32", False)),
+            "config": get_cfg(cfg, "egoallo.config", {}),
+        },
+        "temporal_resampling": {
+            "target_fps": get_cfg(cfg, "temporal_resampling.target_fps", 30.0),
+        },
+    }
 
-    This is intentionally configured after tmp_dir is known, because the user wants
-    the cache to live inside the per-task output tmp directory rather than in a
-    global /app cache. It must be set before EgoAllo/JAX guidance is launched.
-    """
+
+def _maybe_reset_jax_cache_for_signature(cache_dir: Path, cfg: dict[str, Any], project_root: Path) -> dict[str, Any]:
+    reset_enabled = _cfg_bool(
+        get_cfg(cfg, "jax_guidance.compilation_cache.reset_on_signature_mismatch", False),
+        default=False,
+    )
+    signature_file_name = str(
+        get_cfg(
+            cfg,
+            "jax_guidance.compilation_cache.signature_file",
+            ".egoallo_jax_cache_signature.json",
+        )
+    )
+    signature = _jax_compilation_cache_signature(cfg)
+    result = {
+        "enabled": bool(reset_enabled),
+        "cache_dir": str(cache_dir),
+        "signature_file": str(cache_dir / signature_file_name),
+        "reset": False,
+        "reason": "disabled",
+    }
+    if not reset_enabled:
+        return result
+
+    try:
+        cache_dir.relative_to(project_root)
+    except ValueError:
+        result["reason"] = "cache_dir_outside_project_root"
+        print(f"[JAX] Skip cache reset for safety: {cache_dir}", flush=True)
+        return result
+    if cache_dir == project_root:
+        result["reason"] = "cache_dir_is_project_root"
+        print(f"[JAX] Skip cache reset for safety: {cache_dir}", flush=True)
+        return result
+
+    signature_path = cache_dir / signature_file_name
+    old_signature = None
+    if signature_path.exists():
+        try:
+            with signature_path.open("r", encoding="utf-8") as f:
+                old_signature = json.load(f)
+        except Exception:
+            old_signature = None
+
+    if cache_dir.exists() and old_signature != signature:
+        shutil.rmtree(cache_dir)
+        result["reset"] = True
+        result["reason"] = "signature_mismatch" if old_signature is not None else "missing_or_invalid_signature"
+    else:
+        result["reason"] = "signature_match"
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with signature_path.open("w", encoding="utf-8") as f:
+        json.dump(signature, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    return result
+
+
+def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: Path, project_root: Path) -> Path | None:
+    """Enable JAX persistent compilation cache before EgoAllo/JAX guidance starts."""
     enabled = _cfg_bool(
         get_cfg(cfg, "jax_guidance.compilation_cache.enabled", True),
         default=True,
@@ -248,14 +319,24 @@ def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tm
     if not enabled:
         return None
 
-    cache_subdir = str(
-        get_cfg(
-            cfg,
-            "jax_guidance.compilation_cache.cache_subdir",
-            "jax_worker_cache",
+    configured_cache_dir = get_cfg(cfg, "jax_guidance.compilation_cache.cache_dir", None)
+    if configured_cache_dir:
+        cache_dir = Path(str(configured_cache_dir)).expanduser()
+        if not cache_dir.is_absolute():
+            cache_dir = project_root / cache_dir
+        cache_dir = cache_dir.resolve()
+    else:
+        cache_subdir = str(
+            get_cfg(
+                cfg,
+                "jax_guidance.compilation_cache.cache_subdir",
+                "jax_worker_cache",
+            )
         )
-    )
-    cache_dir = (tmp_dir / cache_subdir).expanduser().resolve()
+        cache_dir = (tmp_dir / cache_subdir).expanduser().resolve()
+    reset_result = _maybe_reset_jax_cache_for_signature(cache_dir, cfg, project_root)
+    if reset_result["reset"]:
+        print(f"[JAX] Persistent compilation cache reset: {cache_dir} reason={reset_result['reason']}", flush=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     env["JAX_ENABLE_COMPILATION_CACHE"] = "true"
@@ -283,6 +364,7 @@ def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tm
 
     # Export to both env keys for legacy import paths in EgoAllo code.
     env["EGOALLO_JAX_COMPILATION_CACHE_DIR"] = str(cache_dir)
+    env["EGOALLO_JAX_CACHE_RESET_REASON"] = str(reset_result["reason"])
 
     print(f"[JAX] Persistent compilation cache enabled: {cache_dir}", flush=True)
     return cache_dir
@@ -391,6 +473,14 @@ def write_summary(path: Path, summary: dict[str, Any]) -> None:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
 
+def read_json_file(path: Path) -> dict[str, Any]:
+    with path.expanduser().resolve().open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise TypeError(f"JSON file must contain an object: {path}")
+    return data
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
@@ -408,6 +498,7 @@ def main() -> None:
         (SCRIPT_RUN_GEOCALIB, "run_geocalib.py"),
         (SCRIPT_ESTIMATE_GRAVITY, "01_estimate_gravity_da3_geocalib.py"),
         (SCRIPT_APPLY_ALIGNMENT, "02_apply_alignment_da3_geocalib.py"),
+        (SCRIPT_VALIDATE_POSE_BEFORE_EGOALLO, "05c_validate_pose_before_egoallo.py"),
         (SCRIPT_RUN_EGOALLO, "05_run_egoallo.sh"),
         (SCRIPT_SMOOTH_EGOALLO, "06_smooth_egoallo_segments.py"),
     ]:
@@ -438,9 +529,9 @@ def main() -> None:
     # Keep Python bytecode cache out of project source directories.
     python_pycache_dir, python_pycache_cleanup = configure_python_pycache(env, cfg, tmp_dir)
 
-    # JAX guidance persistent compilation cache lives under <output_dir>/tmp.
+    # JAX guidance persistent compilation cache must be configured before EgoAllo starts.
     # It is configured before any subprocess can launch EgoAllo/JAX guidance.
-    jax_compilation_cache_dir = configure_jax_compilation_cache(env, cfg, tmp_dir)
+    jax_compilation_cache_dir = configure_jax_compilation_cache(env, cfg, tmp_dir, PROJECT_ROOT)
 
     global PIPELINE_RECORDER
     pipeline_log_json = tmp_dir / str(get_cfg(cfg, "output_layout.pipeline_log_json_name", "pipeline_run_log.json"))
@@ -489,6 +580,16 @@ def main() -> None:
     hamer_outputs_pkl_out = egoallo_inputs_dir / "hamer_outputs.pkl"
     final_scene_name = str(get_cfg(cfg, "output_layout.final_scene_name", "final_scene.ply"))
     final_scene_ply = egoallo_outputs_dir / final_scene_name
+    final_smoothed_name = str(get_cfg(cfg, "output_layout.final_smoothed_name", "merged_smoothed_vis.npz"))
+    final_smoothed_npz = egoallo_outputs_dir / final_smoothed_name
+    motion_quality_report_json = tmp_dir / str(get_cfg(cfg, "smooth.report_json_name", "motion_quality_report.json"))
+    pose_validation_report_json = tmp_dir / str(get_cfg(cfg, "pose_validation.report_json_name", "pose_validation_report.json"))
+    pose_validation_result: dict[str, Any] = {
+        "enabled": False,
+        "status": "disabled",
+        "should_run_egoallo": True,
+    }
+    egoallo_inference_skipped = False
     metric_scale_metadata_json = tmp_dir / "metric_scale_metadata.json"
 
     mano_left = resolve_project_path(get_cfg(cfg, "model_weights.mano_left_pkl"))
@@ -937,64 +1038,103 @@ def main() -> None:
         "--output-dir", str(output_dir),
     ], env=env)
 
+    pose_validation_enabled = _cfg_bool(get_cfg(cfg, "pose_validation.enabled", True), default=True)
+    if pose_validation_enabled:
+        pose_validation_floor_z = get_cfg(cfg, "pose_validation.floor_z", None)
+        if pose_validation_floor_z is None:
+            pose_validation_floor_z = get_cfg(cfg, "egoallo.floor_z", None)
+        if pose_validation_floor_z is None:
+            pose_validation_floor_z = get_cfg(cfg, "metric_scale.floor_z", 0.0)
+        pose_validation_num_samples = get_cfg(cfg, "egoallo.num_samples", None)
+        if pose_validation_num_samples is None:
+            pose_validation_num_samples = 1
+        pose_validation_cmd = [
+            py,
+            str(SCRIPT_VALIDATE_POSE_BEFORE_EGOALLO),
+            "--head-trajectory", str(head_trajectory_out),
+            "--timestamps-txt", str(timestamps_txt),
+            "--hamer-pkl", str(hamer_outputs_pkl_out),
+            "--config", str(args.config.expanduser().resolve()),
+            "--report-json", str(pose_validation_report_json),
+            "--output-npz", str(final_smoothed_npz),
+            "--floor-z", str(pose_validation_floor_z),
+            "--num-samples", str(pose_validation_num_samples),
+        ]
+        if _cfg_bool(get_cfg(cfg, "pose_validation.empty_npz_on_fail", True), default=True):
+            pose_validation_cmd.append("--write-empty-on-fail")
+        run(pose_validation_cmd, env=env)
+        pose_validation_result = read_json_file(pose_validation_report_json)
+        pose_validation_result["enabled"] = True
+    else:
+        print("[Pose validation] disabled; continue to EgoAllo inference.", flush=True)
+
+    should_run_egoallo = bool(pose_validation_result.get("should_run_egoallo", True))
+    segment_length = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
+
     # EgoAllo：不再使用 demo/sequence_name，直接使用 output_dir 下的目录。
     # 05_run_egoallo_from_head.py 的可选参数统一由 YAML 的 egoallo 段控制，
     # 这里写入环境变量，再由 05_run_egoallo.sh 转成命令行参数。
-    env["EGOALLO_GUIDANCE_MODE"] = str(get_cfg(cfg, "egoallo.guidance_mode", "hamer_wrist"))
-    env["EGOALLO_GUIDANCE_INNER"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_inner", True)) else "0"
-    env["EGOALLO_GUIDANCE_POST"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_post", True)) else "0"
-    env["EGOALLO_TARGET_SEGMENT_LENGTH"] = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
-    env["EGOALLO_CONTEXT_FRAMES"] = str(get_cfg(cfg, "egoallo.context_frames", 0))
-    env["EGOALLO_SAVE_ONLY_CENTER"] = "1" if bool(get_cfg(cfg, "egoallo.save_only_center", True)) else "0"
-    env["EGOALLO_GLASSES_X_ANGLE_OFFSET"] = str(get_cfg(cfg, "egoallo.glasses_x_angle_offset", 0.0))
-    env["EGOALLO_START_INDEX"] = str(get_cfg(cfg, "egoallo.start_index", 0))
-    env["EGOALLO_SEGMENT_INDEX_OFFSET"] = str(get_cfg(cfg, "egoallo.segment_index_offset", 0))
-    env["EGOALLO_NUM_SAMPLES"] = str(get_cfg(cfg, "egoallo.num_samples", 1))
-    env["EGOALLO_FLOOR_Z"] = str(get_cfg(cfg, "egoallo.floor_z", 0.0))
-    env["EGOALLO_SAVE_TRAJ"] = "1" if bool(get_cfg(cfg, "egoallo.save_traj", True)) else "0"
-    env["EGOALLO_SAVE_ARGS"] = "1" if bool(get_cfg(cfg, "egoallo.save_args", True)) else "0"
-    env["EGOALLO_EMPTY_CACHE_EACH_SEGMENT"] = "1" if bool(get_cfg(cfg, "egoallo.empty_cache_each_segment", False)) else "0"
-    env["EGOALLO_ALLOW_TF32"] = "1" if bool(get_cfg(cfg, "egoallo.allow_tf32", False)) else "0"
-    env["EGOALLO_EXPECTED_HEAD_HEIGHT_MIN"] = str(get_cfg(cfg, "egoallo.expected_head_height_min", 1.0))
-    env["EGOALLO_EXPECTED_HEAD_HEIGHT_MAX"] = str(get_cfg(cfg, "egoallo.expected_head_height_max", 2.2))
-    env["EGOALLO_EGO_CONFIG_PATH"] = str(args.config.expanduser().resolve())
-    env["EGOALLO_JAX_CACHE_LOG"] = str(tmp_dir / "jax_cache_hits.log")
-    if bool(get_cfg(cfg, "egoallo.disable_dlpack", False)):
-        env["EGOALLO_DISABLE_DLPACK"] = "1"
+    if should_run_egoallo:
+        env["EGOALLO_GUIDANCE_MODE"] = str(get_cfg(cfg, "egoallo.guidance_mode", "hamer_wrist"))
+        env["EGOALLO_GUIDANCE_INNER"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_inner", True)) else "0"
+        env["EGOALLO_GUIDANCE_POST"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_post", True)) else "0"
+        env["EGOALLO_TARGET_SEGMENT_LENGTH"] = segment_length
+        env["EGOALLO_CONTEXT_FRAMES"] = str(get_cfg(cfg, "egoallo.context_frames", 0))
+        env["EGOALLO_SAVE_ONLY_CENTER"] = "1" if bool(get_cfg(cfg, "egoallo.save_only_center", True)) else "0"
+        env["EGOALLO_GLASSES_X_ANGLE_OFFSET"] = str(get_cfg(cfg, "egoallo.glasses_x_angle_offset", 0.0))
+        env["EGOALLO_START_INDEX"] = str(get_cfg(cfg, "egoallo.start_index", 0))
+        env["EGOALLO_SEGMENT_INDEX_OFFSET"] = str(get_cfg(cfg, "egoallo.segment_index_offset", 0))
+        env["EGOALLO_NUM_SAMPLES"] = str(get_cfg(cfg, "egoallo.num_samples", 1))
+        env["EGOALLO_FLOOR_Z"] = str(get_cfg(cfg, "egoallo.floor_z", 0.0))
+        env["EGOALLO_SAVE_TRAJ"] = "1" if bool(get_cfg(cfg, "egoallo.save_traj", True)) else "0"
+        env["EGOALLO_SAVE_ARGS"] = "1" if bool(get_cfg(cfg, "egoallo.save_args", True)) else "0"
+        env["EGOALLO_EMPTY_CACHE_EACH_SEGMENT"] = "1" if bool(get_cfg(cfg, "egoallo.empty_cache_each_segment", False)) else "0"
+        env["EGOALLO_ALLOW_TF32"] = "1" if bool(get_cfg(cfg, "egoallo.allow_tf32", False)) else "0"
+        env["EGOALLO_EXPECTED_HEAD_HEIGHT_MIN"] = str(get_cfg(cfg, "egoallo.expected_head_height_min", 1.0))
+        env["EGOALLO_EXPECTED_HEAD_HEIGHT_MAX"] = str(get_cfg(cfg, "egoallo.expected_head_height_max", 2.2))
+        env["EGOALLO_EGO_CONFIG_PATH"] = str(args.config.expanduser().resolve())
+        env["EGOALLO_JAX_CACHE_LOG"] = str(tmp_dir / "jax_cache_hits.log")
+        if bool(get_cfg(cfg, "egoallo.disable_dlpack", False)):
+            env["EGOALLO_DISABLE_DLPACK"] = "1"
 
-    end_index = get_cfg(cfg, "egoallo.end_index", None)
-    if end_index is not None:
-        env["EGOALLO_END_INDEX"] = str(end_index)
+        end_index = get_cfg(cfg, "egoallo.end_index", None)
+        if end_index is not None:
+            env["EGOALLO_END_INDEX"] = str(end_index)
+        else:
+            env.pop("EGOALLO_END_INDEX", None)
+
+        run([
+            "bash",
+            str(SCRIPT_RUN_EGOALLO),
+            str(egoallo_inputs_dir),
+            str(ego_tmp_dir),
+            segment_length,
+        ], env=env)
+
+        # Merge/smooth：从 output_dir/ego_tmp 读取 EgoAllo 分段 .npz，输出到 output_dir/egoallo_outputs。
+        # 06 脚本负责分段接缝 blend 和可选的全局轻量时序平滑。
+        if bool(get_cfg(cfg, "smooth.enabled", True)):
+            smooth_cmd = [
+                py,
+                str(SCRIPT_SMOOTH_EGOALLO),
+                "--input-dir", str(ego_tmp_dir),
+                "--output-dir", str(egoallo_outputs_dir),
+                "--output-name", final_smoothed_name,
+                "--report-json", str(motion_quality_report_json),
+                "--boundary-blend-frames", str(get_cfg(cfg, "smooth.boundary_blend_frames", 0)),
+                "--translation-smooth-window", str(get_cfg(cfg, "smooth.translation_smooth_window", 0)),
+                "--quat-lowpass-alpha", str(get_cfg(cfg, "smooth.quat_lowpass_alpha", 0.0)),
+            ]
+            add_flag(smooth_cmd, "--print-stats", get_cfg(cfg, "smooth.print_stats", True))
+            add_flag(smooth_cmd, "--strict-frame-continuity", get_cfg(cfg, "smooth.strict_frame_continuity", False))
+            run(smooth_cmd, env=env)
     else:
-        env.pop("EGOALLO_END_INDEX", None)
-
-    segment_length = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
-    run([
-        "bash",
-        str(SCRIPT_RUN_EGOALLO),
-        str(egoallo_inputs_dir),
-        str(ego_tmp_dir),
-        segment_length,
-    ], env=env)
-
-    # Merge/smooth：从 output_dir/ego_tmp 读取 EgoAllo 分段 .npz，输出到 output_dir/egoallo_outputs。
-    # 06 脚本负责分段接缝 blend 和可选的全局轻量时序平滑。
-    motion_quality_report_json = tmp_dir / str(get_cfg(cfg, "smooth.report_json_name", "motion_quality_report.json"))
-    if bool(get_cfg(cfg, "smooth.enabled", True)):
-        smooth_cmd = [
-            py,
-            str(SCRIPT_SMOOTH_EGOALLO),
-            "--input-dir", str(ego_tmp_dir),
-            "--output-dir", str(egoallo_outputs_dir),
-            "--output-name", str(get_cfg(cfg, "output_layout.final_smoothed_name", "merged_smoothed_vis.npz")),
-            "--report-json", str(motion_quality_report_json),
-            "--boundary-blend-frames", str(get_cfg(cfg, "smooth.boundary_blend_frames", 0)),
-            "--translation-smooth-window", str(get_cfg(cfg, "smooth.translation_smooth_window", 0)),
-            "--quat-lowpass-alpha", str(get_cfg(cfg, "smooth.quat_lowpass_alpha", 0.0)),
-        ]
-        add_flag(smooth_cmd, "--print-stats", get_cfg(cfg, "smooth.print_stats", True))
-        add_flag(smooth_cmd, "--strict-frame-continuity", get_cfg(cfg, "smooth.strict_frame_continuity", False))
-        run(smooth_cmd, env=env)
+        egoallo_inference_skipped = True
+        print(
+            "[Pose validation] failed; skip EgoAllo inference and keep empty output: "
+            f"{final_smoothed_npz}",
+            flush=True,
+        )
 
     metric_scale_result = None
     if metric_scale_metadata_json.is_file():
@@ -1038,7 +1178,11 @@ def main() -> None:
             "scale_json": str(moge_scale_json) if moge_scale_json is not None else None,
         },
         "metric_scale_result": metric_scale_result,
-        "motion_quality_report": str(motion_quality_report_json),
+        "pose_validation": pose_validation_result,
+        "pose_validation_report": str(pose_validation_report_json) if pose_validation_enabled else None,
+        "egoallo_inference_skipped": bool(egoallo_inference_skipped),
+        "final_smoothed_npz": str(final_smoothed_npz),
+        "motion_quality_report": str(motion_quality_report_json) if not egoallo_inference_skipped else None,
         "egoallo_overlap": {
             "target_segment_length": int(segment_length),
             "context_frames": int(get_cfg(cfg, "egoallo.context_frames", 0)),
@@ -1067,8 +1211,9 @@ def main() -> None:
     #   1) convert_to_ego preprocessing
     #   2) GeoCalib / gravity alignment
     #   3) metric scale correction and front-end JSONL export
-    #   4) EgoAllo segment inference into ego_tmp_dir
-    #   5) 06_smooth_egoallo_segments.py merge-only stage, if smooth.enabled=true
+    #   4) pose validation, which may write an empty final NPZ and skip EgoAllo
+    #   5) EgoAllo segment inference into ego_tmp_dir, if validation passed
+    #   6) 06_smooth_egoallo_segments.py merge-only stage, if smooth.enabled=true and EgoAllo ran
     # If any previous subprocess raises an error, execution will stop before this block,
     # and all intermediate directories will be kept for debugging.
     cleanup_results: dict[str, Any] = {}

@@ -141,7 +141,7 @@ config: &body_mesh_config
   geocalib:
     device: auto
     num_samples: 60
-    min_confidence: 3000
+    min_confidence: 2500
 
     anchor_policy: top_k_best_uncertainty
     top_k_anchors: 5
@@ -162,7 +162,7 @@ config: &body_mesh_config
     geocalib_precheck_height: true
     fallback_to_ransac_on_invalid_height: true
     min_valid_camera_height_margin_factor: 2.0
-    min_camera_above_floor_ratio: 0.95
+    min_camera_above_floor_ratio: 0.99
     min_camera_p10_height_margin_factor: -2.0
 
   metric_scale:
@@ -181,8 +181,8 @@ config: &body_mesh_config
     # 4. 都失败则 warning + scale=1.0
     scale_priority:
       - hands
-      - moge
       - height
+      - moge
       - none
 
     # MoGe scale 后验检查：
@@ -332,46 +332,47 @@ config: &body_mesh_config
     # 在 05_apply_metric_scale.py 与 05_run_egoallo.sh 之间执行。
     enabled: true
     stage: after_metric_scale
+    target_fps: null
 
     head:
       translation_method: pchip
-      rotation_method: slerp
       max_interpolation_gap_sec: 0.40
-      preserve_observed_values: true
-
-    hands:
-      enabled: true
-      interpolation:
-        max_interpolation_gap_sec: 0.30
-        geometry_generation: mano_forward
-        translation_method: pchip
-        split_on_track_id_change: true
-        split_on_handedness_change: true
-        max_wrist_speed_mps: 4.0
-        max_global_angular_speed_deg_s: 150.0
-        max_palm_bone_change_ratio: 0.15
-        max_beta_difference: 2.0
-        interpolated_constraint_scale: 0.35
-        pose_confidence_scale: 1.0
-        interpolated_visualization_scale: 1.0
-        gap_tau_sec: 0.30
-        interp_midpoint_penalty_strength: 0.50
-        apply_gap_decay: true
-        apply_motion_decay: true
-        do_extrapolate: false
-        mano_missing_fallback: missing
-        beta_scope: per_sequence_per_side
-
-    validation:
-      timestamp_tolerance_sec: 0.005
-      max_wrist_speed_mps: 4.0
-      max_wrist_rotation_deg: 150.0
       fail_on_large_head_gap: true
 
     output:
       backup_sparse_inputs: true
       metadata_file: tmp/temporal_resampling_metadata.json
       mapping_file: tmp/temporal_resampling_map.jsonl
+
+  pose_validation:
+    # 在 05b 重采样之后、EgoAllo 推理之前执行。
+    # 检查 head trajectory 和 tabletop-floor 风险；失败时写空的
+    # egoallo_outputs/merged_smoothed_vis.npz，并跳过 05_run_egoallo.sh / 06_smooth。
+    enabled: true
+    empty_npz_on_fail: true
+    report_json_name: pose_validation_report.json
+    floor_z: 0.0
+    metric_scale_trusted: null
+
+    head_height:
+      p01_min_m: 0.0
+      p99_max_m: 3.0
+      p95_min_m: 0.60
+
+    tabletop_floor:
+      enabled: true
+      scene_ply_name: final_scene.ply
+      max_scene_points: 150000
+
+      min_hand_check_count: 10
+
+      scene_below_floor_tolerance_m: 0.05
+      scene_near_floor_height_m: 0.20
+      scene_near_floor_ratio_min: 0.65
+
+      hand_lowest_near_floor_height_m: 0.08
+      hand_palm_near_floor_height_m: 0.20
+      hand_near_floor_ratio_min: 0.50
 
   egoallo:
     # EgoAllo 分段推理参数：
@@ -384,7 +385,7 @@ config: &body_mesh_config
     target_segment_length: 512
 
     # 每段推理时额外看前后多少帧。数值越大，边界上下文越多，但显存估算也越高。
-    context_frames: 32
+    context_frames: 36
 
     # 只保存中间目标段，不保存上下文重叠部分
     save_only_center: true
@@ -403,7 +404,7 @@ config: &body_mesh_config
     save_traj: true
     save_args: false
     empty_cache_each_segment: false
-    allow_tf32: true
+    allow_tf32: false
 
     expected_head_height_min: 1.0
     expected_head_height_max: 2.2
@@ -414,7 +415,7 @@ config: &body_mesh_config
       sampling:
         # 模型扩散时间轴仍为 1000，实际采样运行 50 步
         num_steps: 1000 
-        window_size: 128 
+        window_size: 512
         overlap_size: 32 
         keep_intermediate_states: false 
         cache_clear_every_steps: 0 
@@ -481,7 +482,7 @@ config: &body_mesh_config
     boundary_blend_frames: 36
 
     # root translation 滑窗平滑。0/1 表示关闭；偶数会自动提升为下一个奇数。
-    translation_smooth_window: 0
+    translation_smooth_window: 15
 
     # 旋转低通平滑。0 表示关闭。
     # 建议先试 0.15；如果仍抖，试 0.20~0.30。
@@ -494,7 +495,10 @@ config: &body_mesh_config
   jax_guidance:
     compilation_cache:
       enabled: true
+      cache_dir: jax_cache
       cache_subdir: jax_compilation_cache
+      reset_on_signature_mismatch: true
+      signature_file: .egoallo_jax_cache_signature.json
       min_compile_time_secs: 0
       min_entry_size_bytes: -1
       enable_xla_caches: xla_gpu_per_fusion_autotune_cache_dir

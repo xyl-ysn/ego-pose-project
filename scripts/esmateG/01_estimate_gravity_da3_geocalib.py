@@ -66,6 +66,9 @@ LOW_PRIOR_MAX_NORMAL_ANGLE_DEG = 18.0
 LOW_PRIOR_MIN_INLIERS_ABS = 80
 LOW_PRIOR_MIN_INLIER_RATIO = 0.015
 LOW_PRIOR_PLANES_PER_BAND = 3
+LOW_PRIOR_ACCEPT_MAX_HEIGHT_RANK = 0.35
+LOW_PRIOR_REPLACE_HEIGHT_RANK_DELTA = 0.08
+TABLETOP_RISK_HEIGHT_RANK = 0.35
 
 
 
@@ -1089,6 +1092,68 @@ def validate_camera_height_stats(
         return False, f"p10_height_too_low: {p10:.6g} <= {min_p10:.6g}"
     return True, "valid"
 
+
+def floor_position_stats(P, floor_center, up, params):
+    """
+    Estimate whether a candidate floor sits near the lower envelope.
+
+    height_rank is the fraction of points lower than the candidate plane along
+    the chosen up direction. A high value means the plane is probably elevated
+    above a substantial part of the scene, e.g. a tabletop or platform.
+    """
+    up = normalize(up)
+    heights = np.asarray(P, dtype=np.float64) @ up
+    heights = heights[np.isfinite(heights)]
+    if len(heights) == 0:
+        return {
+            "available": False,
+            "reason": "no_finite_point_heights",
+        }
+
+    center_height = float(np.asarray(floor_center, dtype=np.float64).reshape(3) @ up)
+    margin = float(params.get("height_margin", 1e-5))
+    signed = heights - center_height
+    height_rank = float(np.mean(heights < center_height))
+    below_margin_ratio = float(np.mean(signed < -margin))
+    low_position_valid = height_rank <= LOW_PRIOR_ACCEPT_MAX_HEIGHT_RANK
+    tabletop_risk = height_rank > TABLETOP_RISK_HEIGHT_RANK and below_margin_ratio > 0.05
+
+    return {
+        "available": True,
+        "center_height": center_height,
+        "height_rank": height_rank,
+        "below_margin_ratio": below_margin_ratio,
+        "low_position_valid": bool(low_position_valid),
+        "tabletop_risk": bool(tabletop_risk),
+        "max_valid_height_rank": LOW_PRIOR_ACCEPT_MAX_HEIGHT_RANK,
+        "tabletop_risk_height_rank": TABLETOP_RISK_HEIGHT_RANK,
+    }
+
+
+def should_replace_with_low_prior_floor(
+    ransac_floor_stats,
+    low_floor_stats,
+    low_height_valid,
+):
+    if not low_height_valid:
+        return False, "low_prior_camera_height_invalid"
+    if not low_floor_stats.get("available", False):
+        return False, low_floor_stats.get("reason", "low_prior_floor_stats_unavailable")
+    if not low_floor_stats.get("low_position_valid", False):
+        return False, "low_prior_floor_not_low_enough"
+
+    if not ransac_floor_stats.get("available", False):
+        return True, "ransac_floor_stats_unavailable"
+
+    ransac_rank = float(ransac_floor_stats.get("height_rank", 1.0))
+    low_rank = float(low_floor_stats.get("height_rank", 1.0))
+    if bool(ransac_floor_stats.get("tabletop_risk", False)):
+        return True, "ransac_tabletop_risk"
+    if low_rank + LOW_PRIOR_REPLACE_HEIGHT_RANK_DELTA < ransac_rank:
+        return True, "low_prior_floor_is_lower"
+
+    return False, "ransac_floor_already_low_enough"
+
 # ============================================================
 # Main
 # ============================================================
@@ -1192,8 +1257,11 @@ def main():
     geocalib_flip_precheck_height_stats = {}
     geocalib_flip_precheck_valid = None
     geocalib_flip_precheck_reason = None
+    geocalib_direction_consistent = None
     used_geocalib_prior = False
     low_prior_stats = {}
+    ransac_floor_position_stats = {}
+    final_floor_position_stats = {}
 
     selected = selected_ransac
     up = up_ransac
@@ -1212,6 +1280,13 @@ def main():
         min_camera_above_floor_ratio=args.min_camera_above_floor_ratio,
         min_camera_p10_height_margin_factor=args.min_camera_p10_height_margin_factor,
     )
+    ransac_floor_position_stats = floor_position_stats(
+        P,
+        floor_center_ransac,
+        up_ransac,
+        params,
+    )
+    final_floor_position_stats = ransac_floor_position_stats
 
     geocalib_precheck_height_stats = {}
     geocalib_precheck_valid = None
@@ -1245,6 +1320,7 @@ def main():
         else:
             geocalib_angle_deg = angle_deg(up_ransac, up_geocalib)
             geocalib_raw_angle_deg = geocalib_angle_deg
+            geocalib_direction_consistent = geocalib_angle_deg <= args.geocalib_switch_angle_deg
             print(f"RANSAC vs GeoCalib angle: {geocalib_angle_deg:.6f} deg")
 
             if geocalib_angle_deg > args.geocalib_switch_angle_deg:
@@ -1376,22 +1452,113 @@ def main():
                             final_camera_height_stats = ransac_camera_height_stats
                             final_height_valid = ransac_height_valid
                             final_height_reason = ransac_height_reason
+                            final_floor_position_stats = ransac_floor_position_stats
                             low_prior_stats["fallback_to_ransac"] = True
                             low_prior_stats["fallback_reason"] = fallback_reason
                             decision_reason = fallback_reason
                         else:
                             used_geocalib_prior = True
+                            final_floor_position_stats = floor_position_stats(
+                                P,
+                                floor_center,
+                                up,
+                                params,
+                            )
                             decision_reason = (
                                 "geocalib_disagrees_with_ransac_prior_refined_and_accepted: "
                                 f"angle={geocalib_angle_deg:.6f} > {args.geocalib_switch_angle_deg:.6f}; "
                                 f"height_valid={final_height_valid}; reason={final_height_reason}"
                             )
             else:
-                # If image gravity and point-cloud geometry agree, keep the geometry result.
-                decision_reason = (
-                    "geocalib_agrees_with_ransac_use_ransac: "
-                    f"angle={geocalib_angle_deg:.6f} <= {args.geocalib_switch_angle_deg:.6f}"
+                # Direction agreement is not enough: still check whether the
+                # selected RANSAC plane is too high, and search lower-envelope
+                # planes along the same up direction.
+                selected_low, low_prior_stats = select_low_prior_floor_plane(
+                    P,
+                    cam_centers,
+                    params,
+                    up_geocalib,
                 )
+                low_prior_stats["direction_consistent"] = True
+                low_prior_stats["ransac_floor_position_stats"] = ransac_floor_position_stats
+
+                if selected_low is not None:
+                    low_up, low_floor_center, low_floor_mask = refine_floor_coarse_to_fine(
+                        P,
+                        selected_low,
+                        params,
+                        min_inliers=int(selected_low.get("min_refine_inliers", MIN_INLIERS_ABS)),
+                    )
+                    low_up = final_sign_check(
+                        P,
+                        low_up,
+                        low_floor_center,
+                        cam_centers,
+                        params,
+                        up_prior=up_geocalib,
+                    )
+                    low_camera_height_stats = camera_height_stats(
+                        cam_centers,
+                        low_floor_center,
+                        low_up,
+                        params,
+                    )
+                    low_height_valid, low_height_reason = validate_camera_height_stats(
+                        low_camera_height_stats,
+                        min_valid_camera_height_margin_factor=args.min_valid_camera_height_margin_factor,
+                        min_camera_above_floor_ratio=args.min_camera_above_floor_ratio,
+                        min_camera_p10_height_margin_factor=args.min_camera_p10_height_margin_factor,
+                    )
+                    low_floor_position_stats = floor_position_stats(
+                        P,
+                        low_floor_center,
+                        low_up,
+                        params,
+                    )
+                    replace_with_low, replace_reason = should_replace_with_low_prior_floor(
+                        ransac_floor_position_stats,
+                        low_floor_position_stats,
+                        low_height_valid,
+                    )
+
+                    low_prior_stats.update({
+                        "low_camera_height_stats": low_camera_height_stats,
+                        "low_height_valid": bool(low_height_valid),
+                        "low_height_reason": str(low_height_reason),
+                        "low_floor_position_stats": low_floor_position_stats,
+                        "replace_with_low_prior": bool(replace_with_low),
+                        "replace_reason": str(replace_reason),
+                    })
+
+                    if replace_with_low:
+                        selected = selected_low
+                        up = low_up
+                        floor_center = low_floor_center
+                        floor_mask = low_floor_mask
+                        used_geocalib_prior = True
+                        final_camera_height_stats = low_camera_height_stats
+                        final_height_valid = low_height_valid
+                        final_height_reason = low_height_reason
+                        final_floor_position_stats = low_floor_position_stats
+                        decision_reason = (
+                            "geocalib_agrees_with_ransac_low_floor_selected: "
+                            f"angle={geocalib_angle_deg:.6f} <= {args.geocalib_switch_angle_deg:.6f}; "
+                            f"reason={replace_reason}; height_valid={low_height_valid}"
+                        )
+                    else:
+                        final_floor_position_stats = ransac_floor_position_stats
+                        decision_reason = (
+                            "geocalib_agrees_with_ransac_low_floor_checked_keep_ransac: "
+                            f"angle={geocalib_angle_deg:.6f} <= {args.geocalib_switch_angle_deg:.6f}; "
+                            f"reason={replace_reason}; low_height_reason={low_height_reason}"
+                        )
+                else:
+                    final_floor_position_stats = ransac_floor_position_stats
+                    decision_reason = (
+                        "geocalib_agrees_with_ransac_no_low_floor_candidate_keep_ransac: "
+                        f"angle={geocalib_angle_deg:.6f} <= {args.geocalib_switch_angle_deg:.6f}; "
+                        f"ransac_floor_position={ransac_floor_position_stats}"
+                    )
 
     target_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     R_align = rotation_from_vectors(up, target_up)
@@ -1429,6 +1596,11 @@ def main():
             else np.array(np.nan, dtype=np.float64)
         ),
         geocalib_flipped_180=np.array(geocalib_flipped_180, dtype=bool),
+        geocalib_direction_consistent=(
+            np.array(geocalib_direction_consistent, dtype=bool)
+            if geocalib_direction_consistent is not None
+            else np.array(False, dtype=bool)
+        ),
         used_geocalib_prior=np.array(used_geocalib_prior, dtype=bool),
         fallback_to_ransac=np.array(fallback_to_ransac, dtype=bool),
         fallback_reason=np.array(str(fallback_reason or ""), dtype=object),
@@ -1436,6 +1608,8 @@ def main():
         ransac_camera_height_stats_json=np.array(json.dumps(ransac_camera_height_stats), dtype=object),
         geocalib_precheck_height_stats_json=np.array(json.dumps(geocalib_precheck_height_stats), dtype=object),
         final_camera_height_stats_json=np.array(json.dumps(final_camera_height_stats), dtype=object),
+        ransac_floor_position_stats_json=np.array(json.dumps(ransac_floor_position_stats), dtype=object),
+        final_floor_position_stats_json=np.array(json.dumps(final_floor_position_stats), dtype=object),
         height_validation_json=np.array(json.dumps({
             "ransac_height_valid": bool(ransac_height_valid),
             "ransac_height_reason": str(ransac_height_reason),
@@ -1446,6 +1620,7 @@ def main():
             "geocalib_flip_precheck_reason": geocalib_flip_precheck_reason,
             "geocalib_raw_angle_deg": None if geocalib_raw_angle_deg is None else float(geocalib_raw_angle_deg),
             "geocalib_final_angle_deg": None if geocalib_angle_deg is None else float(geocalib_angle_deg),
+            "geocalib_direction_consistent": geocalib_direction_consistent,
             "final_height_valid": bool(final_height_valid),
             "final_height_reason": str(final_height_reason),
             "min_valid_camera_height_margin_factor": float(args.min_valid_camera_height_margin_factor),
@@ -1502,6 +1677,7 @@ def main():
     print("GeoCalib flipped 180:", geocalib_flipped_180)
     print("Raw RANSAC vs GeoCalib angle:", geocalib_raw_angle_deg)
     print("RANSAC vs GeoCalib angle:", geocalib_angle_deg)
+    print("GeoCalib direction consistent:", geocalib_direction_consistent)
     print("Used GeoCalib prior:", used_geocalib_prior)
     print("Fallback to RANSAC:", fallback_to_ransac)
     print("Decision reason:", decision_reason)
@@ -1509,6 +1685,8 @@ def main():
     print("GeoCalib precheck height stats:", geocalib_precheck_height_stats)
     print("GeoCalib flip precheck height stats:", geocalib_flip_precheck_height_stats)
     print("Final camera height stats:", final_camera_height_stats)
+    print("RANSAC floor position stats:", ransac_floor_position_stats)
+    print("Final floor position stats:", final_floor_position_stats)
     print("Final height valid:", final_height_valid, "reason:", final_height_reason)
     print("Check R_align @ up:", R_align @ up)
     print("Angle to +Y after alignment:", angle_error, "deg")
