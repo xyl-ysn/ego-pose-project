@@ -22,14 +22,14 @@ args: []
 
 modelData:
   # Local project checkout on this machine.
-  hostPath: /home/xieyongling/slam_project/ego-pose-project
+  hostPath: /home/opsuser/thk/xyl_ysn_project
   hostPathType: Directory
   readOnly: true
   external:
-    subPath: third_party
+    subPath: exp
     mountPath: /app/external/human_pose_tool
   weights:
-    subPath: third_party
+    subPath: exp
     mountPath: /app/weights/human_pose_tool
 
 resources:
@@ -46,7 +46,7 @@ env:
   SERVICE_NAME: "zata-model-human-pose-tool"
   SERVICE_VERSION: "1.0.0"
   MODEL_TYPE: "human_pose_tool"
-  MODEL_NAMES: "EgoAllo,GeoCalib"
+  MODEL_NAMES: "EgoGVAE,GeoCalib,FoundationGeo"
   ZATA_MANAGER_BASE_URL: "http://10.9.103.101:31052"
   ZATA_MANAGER_POLL_INTERVAL: "3"
   ZATA_MANAGER_CALLBACK_TIMEOUT: "30"
@@ -68,69 +68,91 @@ config: &body_mesh_config
     device: cuda
 
   model_sources:
-    egoallo_root: third_party/egoallo
-    geocalib_root: third_party/GeoCalib
-    moge_root: third_party/MoGe
+    egogvae_root: ../exp/EgoGVAE_release
+    egoallo_root: ../exp/egoallo
+    geocalib_root: ../exp/GeoCalib
+    foundationgeo_root: ../exp/FoundationGeo
 
   model_weights:
-    egoallo_checkpoint_dir: third_party/egoallo/egoallo_checkpoint_april13
-    egoallo_model_config_path: third_party/egoallo/egoallo_checkpoint_april13/model_config.yaml
-    egoallo_model_npz: third_party/egoallo/data/smplh/neutral/model.npz
+    egogvae_checkpoint_path: ../exp/EgoGVAE_release/weights/_latest.pth
+    egoallo_checkpoint_dir: ../exp/egoallo/egoallo_checkpoint_april13/checkpoints_3000000
 
-    geocalib_pinhole_tar: third_party/GeoCalib/weigths/pinhole.tar
+    geocalib_pinhole_tar: ../exp/GeoCalib/weigths/pinhole.tar
 
     mano_left_pkl: model/MANO_LEFT.pkl
     mano_right_pkl: model/MANO_RIGHT.pkl
 
-    smplh_npz_path: third_party/egoallo/data/smplh/neutral/model.npz
-    # 本机当前没有找到 MoGe model.pt；留空时 run_body_mesh.py 会跳过 MoGe，
-    # 继续使用 hands / height fallback 做 metric scale。
-    moge_model_pt: third_party/MoGe/weight/model.pt
+    smplh_npz_path: ../exp/EgoGVAE_release/weights/smplh/neutral/model.npz
+    foundationgeo_model_pt: ../exp/FoundationGeo/weights/FoundationGeo.pt
 
   output_layout:
     tmp_dir_name: tmp
-    egoallo_inputs_dir_name: egoallo_inputs
-    egoallo_outputs_dir_name: egoallo_outputs
-    ego_tmp_dir_name: ego_tmp
+    egogvae_inputs_dir_name: egoallo_inputs
+    egogvae_outputs_dir_name: egoallo_outputs
+    egogvae_tmp_dir_name: egoallo_tmp
+    assets_pointclouds_dir_name: assets/pointclouds
+    assets_poses_dir_name: assets/poses
     final_scene_name: final_scene.ply
-    final_smoothed_name: merged_smoothed_vis.npz
+    egogvae_motion_name: egogvae_motion.npz
     pipeline_log_json_name: pipeline_run_log.json
 
     cleanup:
       tmp: false
-      egoallo_inputs: false
-      ego_tmp: false
+      egogvae_inputs: false
+      egogvae_tmp: false
+      egoallo_outputs: false
+      assets_pointclouds: false
+      assets_poses: false
+
+  hand_filter:
+    # Assumes other people's hands are farther from the camera than the wearer's.
+    enabled: true
+    near_distance_ratio: 3.0
+    min_support: 3
+    # Match short gaps by geometry, including new source chunk IDs; never fill observations.
+    max_gap_seconds: 0.6
+    # Wrist step <= (1 + speed * elapsed_seconds) * wrist-to-middle-MCP length.
+    max_speed_hand_lengths: 20.0
+    # Symmetric camera-distance ratio to the last accepted observation, regardless of ID.
+    max_distance_change_ratio: 1.5
+    # Minimum runner-up / best ratio: distance at initialization, 1 + match error thereafter.
+    ambiguity_ratio: 1.25
+    # Applied only after a metric scale has been obtained; camera-to-wrist radius.
+    max_camera_distance_m: 1.2
 
   hawor_extract:
-    # 这些参数决定“上游检测到的手”有多少会真正进入 EgoAllo 的 hamer_outputs.pkl。
-    # 如果怀疑手部约束太少，可以临时改成：
-    #   drop_isolated: false
-    #   min_track_len: 1
-    #   soft_start_frames: 1
-    #   soft_end_frames: 1
-    # 这样会尽量保留检测帧并给满权重，但更容易把抖动/误检也作为强约束。
-    soft_start_frames: 15
-    soft_end_frames: 10
+    # 1 disables endpoint fading; retain observed constraints for EgoAllo guidance.
+    soft_start_frames: 1
+    soft_end_frames: 1
     min_output_alpha: 0.0
     drop_isolated: true
     min_track_len: 3
     trim_segment_edges: 0
-    max_gap_fill: 3
+    max_gap_fill: 0
     max_gap_endpoint_hand_ratio: 1.5
-    smooth_window: 5
+    # Keep each accepted HaWoR hand at its original VGGT-world position.
+    smooth_window: 1
     smooth_mode: translation
-    soft_start_geometry: true
+    soft_start_geometry: false
     soft_start_anchor_max_gap: 45
     max_wrist_step_hand_ratio: 1.5
+    local_mad_window: 7
+    local_mad_multiplier: 6.0
+    local_mad_min_samples: 4
     print_jump_stats: true
 
   hawor_stabilize:
+    # 0 preserves upstream side labels and their corresponding MANO records.
+    max_flip_dist_ratio: 0.0
     max_wrist_step_hand_ratio: 1.5
-    min_track_len: 6
-    soft_start_frames: 20
-    soft_end_frames: 10
+    local_mad_window: 7
+    local_mad_multiplier: 6.0
+    local_mad_min_samples: 4
+    min_track_len: 3
+    soft_start_frames: 1
+    soft_end_frames: 1
     min_alpha_to_keep: 0.0
-    duplicate_mode: drop_both
+    duplicate_mode: keep_best
 
   hamer_build:
     mano_frame_key: frame_id
@@ -140,12 +162,11 @@ config: &body_mesh_config
 
   geocalib:
     device: auto
-    num_samples: 60
+    num_samples: 40
     min_confidence: 2500
 
     anchor_policy: top_k_best_uncertainty
     top_k_anchors: 5
-    follow_frames: 2
     empty_policy: skip
 
     viz_enabled: false
@@ -154,6 +175,7 @@ config: &body_mesh_config
     viz_save_selected: false
 
   alignment:
+    # 以下 geocalib_* 只在“没有真实 IMU”时生效。有真实 IMU 时走 real_sensor 段。
     use_geocalib_prior: true
     geocalib_vector_type: gravity
     geocalib_switch_angle_deg: 10.0
@@ -161,9 +183,72 @@ config: &body_mesh_config
 
     geocalib_precheck_height: true
     fallback_to_ransac_on_invalid_height: true
+
+    # 这三项是相机(头)高度校验阈值，无 IMU 与有 IMU 两条路径共用。
     min_valid_camera_height_margin_factor: 2.0
     min_camera_above_floor_ratio: 0.99
     min_camera_p10_height_margin_factor: -2.0
+
+  real_sensor:
+    # --real-sensor-input 提供标定、IMU 或深度流时生效。
+    # RGB 内参用于 FoundationGeo；episode depth zarr 按 frame_id 匹配相机标定。
+    # auto 按 episode.json 中对应 modality 选择，双目设备可显式指定 camera_left/right。
+    rgb_camera_stream_id: auto
+    depth_camera_stream_id: auto
+
+    # 有真实 IMU 时的重力对齐策略：
+    # 1. 有真实 IMU 时不跑全局纯点云 RANSAC，也不回退到纯点云 RANSAC；
+    # 2. 先按 imu_vector_type 解释 imu_gravity.txt；若有可匹配手部数据，则用
+    #    camera_above_hand_ratio 校验正负号，小于 imu_min_camera_above_hand_ratio 时翻转；
+    # 3. 只用 IMU 方向在最低相机高度以下搜索地面候选，按 2/5/8/12/18 分位顺序扫；
+    # 4. 某个分位 cutoff 或拟合 level 不低于最低相机高度时，停止继续向上搜索；
+    # 5. 每个分位内逐次拟合并移除平面，最多 8 个；该分位候选全部不合格后再进入下一分位；
+    #    refine_floor_coarse_to_fine 仅用当前候选内点精修，不重新吸纳已移除平面或分位外点；
+    # 6. 重估法向与 IMU 方向夹角 <= imu_max_refine_angle_deg，则接受该 refine 后的地面方向；
+    # 7. 所有候选角度都超限，则标记 IMU 对齐失败，仍输出对齐文件/点云/前端输入，后续跳过 EgoGVAE。
+    # 头部高度/地面低包络校验仍写日志和元数据，但在真实 IMU 模式下只做诊断，不阻断接受。
+    # 日志统一带 [IMU] 前缀，和无 IMU 的 GeoCalib 日志区分开。
+
+    # 重力方向取“最静止的一段”，不是整段中位数：
+    # 头一转，相机系下的加速度方向就跟着转，整段中位数不对应任何一帧。
+    # 判定静止用：加速度方向抖动 + 模长偏离重力值 + 陀螺仪静止程度；
+    # 选中的窗口会按时间匹配到对应帧号写进 imu_gravity.txt 第一列，
+    # 下游用那一帧的位姿把相机系向量转到世界系。
+    imu_stationary_window_sec: 0.5
+    imu_stationary_max_gyro: 0.25
+    imu_stationary_max_dir_spread_deg: 3.0
+    imu_stationary_max_norm_rel_dev: 0.05
+
+    # imu_gravity.txt 先按 imu_vector_type 解释；若有可匹配手部数据，则用“相机/头部高度应高于手部高度”
+    # 校验正负号。camera_above_hand_ratio 小于阈值时翻转；没有手部数据时保持 imu_vector_type 的方向。
+    # up/upright = 文件向量就是上；gravity/down/g = 文件向量是重力向下，会取反成上。
+    imu_vector_type: up
+    imu_min_camera_above_hand_ratio: 0.8
+    imu_outlier_angle_deg: 180.0
+
+    # 点云法向偏离 IMU 的最大角度；超限先尝试同一低分位内其他平面，再进入下一分位。
+    imu_max_refine_angle_deg: 2
+
+    # 头部高度合理性判断阈值（全部是尺度无关的比例量）：
+    # imu_max_head_height_rel_spread: 头高 (p90-p10)/median 上限，防止 IMU 轴倾斜导致头高漂移
+    # imu_max_points_below_floor_ratio: 明显低于该平面的点云比例上限，防止把桌面/台面当地面
+    # imu_min_head_span_ratio / imu_max_head_span_ratio: 头高占场景竖直跨度的合理区间，
+    #   上限放宽是为了容忍“只重建出地面附近、竖直跨度很小”的浅场景
+    imu_max_head_height_rel_spread: 0.75
+    imu_max_points_below_floor_ratio: 0.05
+    imu_min_head_span_ratio: 0.15
+    imu_max_head_span_ratio: 2.50
+
+    # 真实深度尺度估计（在对齐之后执行）。
+    # 用已估计重力方向，逐帧反投影真实深度并拟合低处水平地面，
+    # 再把每个有效深度帧匹配到原始 VGGT 轨迹对应帧，用该帧对齐后的相机高度求尺度。
+    depth_unit_scale: 1.0
+    # 真实地面只在少数帧出现时，增加时间覆盖率；同一候选簇按隐含尺度聚类。
+    depth_scale_num_samples: 64
+    depth_scale_cluster_rel_tol: 0.08
+    depth_scale_min_support_frames: 3
+    depth_scale_local_window: 15
+    depth_scale_local_min_support_frames: 6
 
   metric_scale:
     enabled: true
@@ -174,151 +259,45 @@ config: &body_mesh_config
     #点云降采样
     final_scene_output_voxel_size: 0
 
-    # 尺度估计优先级：
-    # 1. 手骨架
-    # 2. MoGe
-    # 3. 疑似直立阶段头部高度
-    # 4. 都失败则 warning + scale=1.0
-    scale_priority:
-      - hands
-      - height
-      - moge
-      - none
+    # 无真实深度时的尺度估计策略：
+    # 1. FoundationGeo 使用上游逐帧内参生成度量深度图
+    # 2. 按真实深度路线沿重力方向寻找地面，得到相机绝对高度尺度
+    # 3. 取 max(FoundationGeo 地面尺度, hand 尺度)
+    # 4. 若缩放后 p90 头高超过 1.60 m，则将最终尺度压到 1.60 m
+    max_p90_head_height: 1.65
 
-    # MoGe scale 后验检查：
-    # 这里的 min/max 只用于 MoGe 的 p90 头高 sanity check。
-    # hand scale 不用这个区间拒绝，只在 p90 头高超过 hand_fallback.max_p90_head_height 时缩小。
-    scale_sanity:
+    foundationgeo:
       enabled: true
-      statistic: percentile
-      percentile: 90
+      output_dir_name: foundationgeo_metric_scale
 
-      # 这里故意比 1.50-1.60 宽很多，避免弯腰/低头误杀 MoGe
-      min_valid_head_height: 0.80
-      max_valid_head_height: 1.70
-
-      reject_moge_if_invalid_height: true
-      reject_hands_if_invalid_height: false
-
-    moge:
-      enabled: true
-      output_dir_name: moge_metric_scale
-
-      # 先均匀抽 48 帧作为候选，只做 CPU 轻量质量检查
-      candidate_samples: 48
-
-      # 从候选帧中选质量最好的 24 帧真正跑 MoGe
-      # 想快可以 16，想稳可以 32
-      num_samples: 24
-
-      # MoGe scale 最终至少需要多少有效帧
-      min_valid_frames: 4
-      min_valid_pixels: 1000
-
-      min_depth_m: 0.2
-      max_depth_m: 8.0
-
-      min_scale: 0.05
-      max_scale: 20.0
-      max_frame_relative_mad: 0.35
-      max_final_relative_mad: 0.35
-
-      # MoGe 投影有效点质量检查。有效点指 MoGe depth / 重建投影 depth 都有效，
-      # 且 ratio 在 min_scale/max_scale 内、真正参与 scale 估计的像素。
-      projection_quality_enabled: true
-
-      # 投影点 bbox 覆盖图像面积比例，太小说明只集中在很小区域
-      min_projection_area_ratio: 0.01
-
-      # 有效点的 MoGe 深度 p95-p05 范围，太小说明深度层次不足
-      min_depth_range_m: 0.25
-
-      # 近/中/远三层中，每层至少占多少才算被覆盖
-      min_depth_layer_ratio: 0.03
-
-      # 至少覆盖几层深度，避免只来自单一深度平面
-      min_depth_layer_count: 2
-
-      # 中心 50% 图像区域内有效点占比，超过则认为过度集中在图像中心
-      max_center_region_ratio: 0.90
-
-      # 静态背景代理分数：覆盖面积、深度范围、深度分层、空间分散度综合得分
-      min_static_background_score: 0.35
-
-      max_points: 250000
+      # 深度图保存在 <output_dir>/tmp/foundationgeo_metric_scale/depth。
+      num_samples: 64
+      depth_scale_cluster_rel_tol: 0.08
+      depth_scale_min_support_frames: 3
       device: cuda
-      fp16: true
+      fp16: false
       resolution_level: 9
-      use_intrinsics_fov: true
 
-      save_depth_maps: false
-      save_projection_matches: false
-      save_sampled_frames: false
-
-      # CPU 轻量图像质量检查阈值
-      # 亮度均值太低认为过暗
-      min_quality_brightness: 25.0
-
-      # 亮度均值太高认为过曝
-      max_quality_brightness: 235.0
-
-      # 暗像素比例太高则降分或过滤
-      max_quality_dark_ratio: 0.45
-
-      # 过曝像素比例太高则降分或过滤
-      max_quality_bright_ratio: 0.45
-
-      # Laplacian 方差，越小越模糊
-      min_quality_laplacian_var: 20.0
-
-      # 灰度标准差，越小说明纹理/对比度越少
-      min_quality_texture_std: 8.0
-
-      # 边缘密度，越小说明纹理/结构太少
-      min_quality_edge_density: 0.01
-
-      # 边缘判断阈值
-      quality_edge_threshold: 20.0
-
-      # 建议 false：MoGe 失败不要中断，继续 fallback 到 hands / height / none
+      # FoundationGeo 失败时继续使用 hand 尺度。
       strict: false
 
-    hand_fallback:
+    hands:
       enabled: true
       min_valid_bones: 20
       max_relative_mad: 0.35
       min_scale: 0.05
       max_scale: 20.0
-      max_p90_head_height: 1.65
 
       bones:
         - name: wrist_middle_mcp
           i: 0
           j: 9
-          length_m: 0.115
+          length_m: 0.095
 
         - name: index_pinky_mcp
           i: 5
           j: 17
-          length_m: 0.088
-
-    # 第三 fallback：找疑似直立阶段的头部高度，而不是全段 median
-    height_fallback:
-      enabled: true
-      mode: standing_head_height
-      statistic: percentile
-      percentile: 90
-
-      # 直立时头部/头戴相机离地高度目标值
-      target_height: 1.55
-
-      min_valid_height: 0.5
-      max_valid_height: 2.9
-      min_candidate_frames: 10
-
-      min_scale: 0.05
-      max_scale: 20.0
-      smooth_window: 1
+          length_m: 0.075
 
     frontend:
       enabled: true
@@ -328,26 +307,10 @@ config: &body_mesh_config
       head_jsonl_name: head_trajectory_egoallo.jsonl
       hands_jsonl_name: hand_keypoints_egoallo.jsonl
 
-  temporal_resampling:
-    # 在 05_apply_metric_scale.py 与 05_run_egoallo.sh 之间执行。
-    enabled: true
-    stage: after_metric_scale
-    target_fps: null
-
-    head:
-      translation_method: pchip
-      max_interpolation_gap_sec: 0.40
-      fail_on_large_head_gap: true
-
-    output:
-      backup_sparse_inputs: true
-      metadata_file: tmp/temporal_resampling_metadata.json
-      mapping_file: tmp/temporal_resampling_map.jsonl
-
   pose_validation:
-    # 在 05b 重采样之后、EgoAllo 推理之前执行。
+    # 在 metric scale 之后、EgoGVAE 推理之前执行。
     # 检查 head trajectory 和 tabletop-floor 风险；失败时写空的
-    # egoallo_outputs/merged_smoothed_vis.npz，并跳过 05_run_egoallo.sh / 06_smooth。
+    # egogvae_outputs/merged_smoothed_vis.npz，并跳过 EgoGVAE 推理。
     enabled: true
     empty_npz_on_fail: true
     report_json_name: pose_validation_report.json
@@ -357,146 +320,98 @@ config: &body_mesh_config
     head_height:
       p01_min_m: 0.0
       p99_max_m: 3.0
-      p95_min_m: 0.60
+      p95_min_m: 0.80
 
-    tabletop_floor:
-      enabled: true
-      scene_ply_name: final_scene.ply
-      max_scene_points: 150000
-
-      min_hand_check_count: 10
-
-      scene_below_floor_tolerance_m: 0.05
-      scene_near_floor_height_m: 0.20
-      scene_near_floor_ratio_min: 0.65
-
-      hand_lowest_near_floor_height_m: 0.08
-      hand_palm_near_floor_height_m: 0.20
-      hand_near_floor_ratio_min: 0.50
-
-  egoallo:
-    # EgoAllo 分段推理参数：
-    # - target_segment_length 是每段最终保存的帧数。
-    # - context_frames 是每段推理时额外读取的前后输入帧，只提供 head/hands/timestamps 上下文。
-    # - save_only_center=true 时，只保存 target 中心段，context 部分会被裁掉。
-    # 例：target_segment_length=512, context_frames=30 时，
-    #   第 2 段 target=512-1024，实际 infer=482-1054，最后只保存 512-1024。
-    # 并行模式下，每段是独立 Python 进程；context_frames 不会读取上一段生成的人体 pose。
-    target_segment_length: 512
-
-    # 每段推理时额外看前后多少帧。数值越大，边界上下文越多，但显存估算也越高。
-    context_frames: 36
-
-    # 只保存中间目标段，不保存上下文重叠部分
-    save_only_center: true
-
-    guidance_mode: hamer_wrist
-    guidance_inner: true
-    guidance_post: true
-
-    glasses_x_angle_offset: 0.0
+  egogvae:
+    device: cuda
+    # Full 128-frame noncausal windows at stride 32. Continuity-aware Viterbi
+    # selection picks one window per frame and blends source switches.
+    window_size: 128
+    window_stride: 32
     start_index: 0
     end_index: null
-    segment_index_offset: 0
-    num_samples: 1
     floor_z: 0.0
-
-    save_traj: true
-    save_args: false
-    empty_cache_each_segment: false
-    allow_tf32: false
-
-    expected_head_height_min: 1.0
-    expected_head_height_max: 2.2
-
-    # 以下参数会覆盖 EgoAllo 的采样与约束参数。
-    # 05_run_egoallo_from_head.py 直接从 body_mesh.yaml 读取该段配置。
-    config:
-      sampling:
-        # 模型扩散时间轴仍为 1000，实际采样运行 50 步
-        num_steps: 1000 
-        window_size: 512
-        overlap_size: 32 
-        keep_intermediate_states: false 
-        cache_clear_every_steps: 0 
-        use_expanded_window_tiles: true
-
-      guidance:
-        inner:
-          early_termination: true
-          cost_tolerance: 1e-5
-          gradient_tolerance: 1e-4
-          parameter_tolerance: 1e-6
-
-          # 原来的 10 对 inner_max_iters=1 完全不起作用
-          gradient_tolerance_start_step: 1
-
-        post:
-          early_termination: true
-          cost_tolerance: 1e-5
-          gradient_tolerance: 1e-4
-          parameter_tolerance: 1e-6
-
-          # post 最多 10 次，从第 2 次开始检查 gradient
-          gradient_tolerance_start_step: 2
-
-      constraint_optimization:
-        enabled: true
-
-        # 50 步里最后 24 步，每 3 步执行一次，共约 8 次
-        # 保持和当前 80/10 大致相同的 inner 触发次数
-        inner_max_iters: 1
-        inner_last_steps: 6
-        inner_step_frequency: 3
-
-        # 最终完整修正一次，通过 early termination 控制平均迭代数
-        post_max_iters: 8
-        post_last_steps: 0
-        post_step_frequency: 1
-        post_timing_repeat: 1
-        bucket_t: auto
-        detection_bucket: 0
-        warmup_before_segments: true
-
-        # 质量核心：保留手部约束
-        enable_hand_constraints: true
-
-        # 先关闭最容易慢/炸的约束
-        enable_foot_constraints: true
-        enable_collision_constraints: true
-
-        # 这个可以先 false；如果身体明显不稳，再改 true
-        enable_body_regularization: true
-
-      inference:
-        use_torch_compile: false
-
-      denoiser:
-        compile_model: false
-
-  smooth:
-    enabled: true
-
-    # 只在 EgoAllo 分段接缝前后做局部 blend，缓解分段独立采样导致的人体跳变。
-    # 数值越大，边界越平滑，但越可能抹掉接缝附近的真实动作。36,15,0.2
-    boundary_blend_frames: 36
-
-    # root translation 滑窗平滑。0/1 表示关闭；偶数会自动提升为下一个奇数。
-    translation_smooth_window: 15
-
-    # 旋转低通平滑。0 表示关闭。
-    # 建议先试 0.15；如果仍抖，试 0.20~0.30。
-    quat_lowpass_alpha: 0.20
-
-    print_stats: true
-    strict_frame_continuity: false
+    latent_mode: mean
+    allow_tf32: true
+    seed: 2025
     report_json_name: motion_quality_report.json
-    
+
+    # trajectory selection / stitching weights
+    window_pos_center: 64.0
+    window_pos_trusted_lo: 32.0
+    window_pos_trusted_hi: 96.0
+    window_pos_weight: 1.0
+    contact_confidence_weight: 0.0
+    rotation_weight: 1.0
+    foot_position_weight: 50.0
+    contact_jump_weight: 2.0
+    switch_penalty: 5.0
+    same_frame_rotation_weight: 1.0
+    same_frame_foot_weight: 50.0
+    same_frame_contact_weight: 2.0
+    switch_rotation_threshold_deg: 15.0
+    switch_foot_threshold_m: 0.12
+    transition_region_min: 16
+    transition_region_max: 32
+
+  egoallo_refine:
+    enabled: true
+    guidance_mode: hamer_reproj2
+    device: cuda
+    target_segment_length: 1024
+    context_frames: 36
+    window_size: 128
+    overlap_size: 32
+    num_samples: 1
+    random_seed: 2025
+    # Noise-matched EgoGVAE leg/contact inputs. 0 disables the inference reference.
+    lower_body_reference_strength: 1.0
+    lower_body_reference_seed: 7819
+    # Official soft guidance, including the world-wrist position weight.
+    hamer_abspos_weight: 20.0
+    # LM iteration caps per call; official defaults are inner=5, post=20.
+    # Full-step guidance: checked on demo9/10/12/15/18; avoid last-20-only foot regression.
+    inner_max_iters: 2
+    # Counts actual DDIM iterations (currently 30), not training noise steps.
+    # 0 means all iterations; 40 would also cover all 30. Frequency 1 keeps all calls.
+    inner_last_steps: 0
+    inner_step_frequency: 1
+    post_max_iters: 16
+    # Post runs only once at the end, if its last-step/frequency gate allows it.
+    post_last_steps: 0
+    post_step_frequency: 1
+    # Fixed JAX time axis: target_segment_length + 2 * context_frames (1096).
+    # Padding is masked out and cropped from the saved motion.
+    bucket_t: auto
+    # 0 pads each hand side to bucket_t, independent of observed hand counts.
+    detection_bucket: 0
+    # Symmetric five-frame filter, bounded per-joint correction; fingers unchanged.
+    body_smoothing_max_deg: 5.0
+    # Ground below a fixed world chest/head/arms; pelvis and lower spine may move.
+    # 0 disables this grounding pass. All computations use egoallo_refine.device.
+    grounding_max_iters: 200
+    grounding_spine_max_deg: 8.0
+    grounding_leg_max_deg: 12.0
+    grounding_smoothing_seconds: 0.08
+    # Both stages protect ankle/toe world positions and orientations relative
+    # to the pre-grounding body. Limits apply to the total correction.
+    grounding_foot_xy_max_m: 0.05
+    grounding_foot_rotation_max_deg: 8.0
+    # Final leg-only stabilization after grounding; root/torso/arms stay fixed.
+    leg_max_iters: 250
+    leg_max_correction_deg: 3.0
+    contact_source: egogvae
+    # Keep native soft HaWoR guidance; no additional arm IK.
+    hand_refinement_max_deg: 0.0
+    cache_npz_name: egoallo_hawor_final_cache.npz
+    verbose: false
+    report_json_name: egoallo_refine_report.json
+
   jax_guidance:
     compilation_cache:
       enabled: true
-      cache_dir: jax_cache
-      cache_subdir: jax_compilation_cache
+      # Relative paths are resolved under the project root.
+      output_path: jax_cache
       reset_on_signature_mismatch: true
       signature_file: .egoallo_jax_cache_signature.json
       min_compile_time_secs: 0
@@ -506,7 +421,7 @@ config: &body_mesh_config
       debug_log_modules: false
 
   python_cache:
-    redirect_pycache_to_tmp: true
+    redirect_pycache_to_tmp: false
     pycache_subdir: pycache
     cleanup_existing_scripts_pycache: true
 

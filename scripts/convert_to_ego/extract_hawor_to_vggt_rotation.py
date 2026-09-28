@@ -22,6 +22,11 @@ def main():
         action="store_true",
         help="If --alignment-json is absent, write an identity rotation instead of failing.",
     )
+    ap.add_argument(
+        "--transpose",
+        action="store_true",
+        help="Transpose the loaded rotation before saving.",
+    )
     args = ap.parse_args()
 
     if args.missing_is_identity and not args.alignment_json.is_file():
@@ -33,6 +38,8 @@ def main():
         for key in args.json_key.split("."):
             value = value[key]
         R = np.asarray(value, dtype=np.float32)
+        if args.transpose:
+            R = R.T
 
     if R.shape != (3, 3):
         raise ValueError(f"Expected 3x3 rotation, got {R.shape}")

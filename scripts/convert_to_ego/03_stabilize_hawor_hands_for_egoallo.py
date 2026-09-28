@@ -136,6 +136,57 @@ def normalized_distance(a, b, frame_gap=1):
     return float(np.linalg.norm(wa - wb) / denom)
 
 
+def _nominal_dt(timestamps):
+    if timestamps is None:
+        return None
+    ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+    if ts.size < 2:
+        return None
+    dt = np.diff(ts)
+    dt = dt[np.isfinite(dt) & (dt > 1e-8)]
+    if dt.size == 0:
+        return None
+    return float(np.median(dt))
+
+
+def _dt_units(timestamps, prev_idx, idx, nominal_dt):
+    frame_gap = max(1, int(idx) - int(prev_idx))
+    if timestamps is None or nominal_dt is None or nominal_dt <= 0.0:
+        return float(frame_gap)
+    try:
+        dt = float(timestamps[idx]) - float(timestamps[prev_idx])
+    except (IndexError, TypeError, ValueError):
+        return float(frame_gap)
+    if not np.isfinite(dt) or dt <= 1e-8:
+        return float(frame_gap)
+    return max(dt / nominal_dt, 1e-6)
+
+
+def normalized_velocity(a, b, prev_idx, idx, timestamps=None, nominal_dt=None):
+    wa, wb = wrist(a), wrist(b)
+    sa, sb = hand_size(a), hand_size(b)
+    if wa is None or wb is None or sa is None or sb is None:
+        return None
+    denom = max(1e-8, 0.5 * (sa + sb)) * _dt_units(timestamps, prev_idx, idx, nominal_dt)
+    return float(np.linalg.norm(wa - wb) / denom)
+
+
+def _local_mad_threshold(values, center_idx, window, multiplier, min_samples):
+    if window <= 0 or multiplier <= 0.0:
+        return None
+    values = np.asarray(values, dtype=np.float64)
+    radius = max(1, int(window) // 2)
+    lo = max(0, int(center_idx) - radius)
+    hi = min(values.size, int(center_idx) + radius + 1)
+    local = values[lo:hi]
+    local = local[np.isfinite(local)]
+    if local.size < int(min_samples):
+        return None
+    med = float(np.median(local))
+    mad = float(np.median(np.abs(local - med)))
+    return med + float(multiplier) * max(1.4826 * mad, 1e-6)
+
+
 def copy_hand(hand):
     out = {}
     for k, v in hand.items():
@@ -164,6 +215,8 @@ def fix_side_flips(items, max_flip_dist_ratio, flip_margin_ratio):
     than to the previous same-side wrist. Distances are normalized by hand size, so
     this works for both metric and arbitrary VGGT scale.
     """
+    if max_flip_dist_ratio <= 0:
+        return 0
     last = {"left": None, "right": None}
     last_idx = {"left": None, "right": None}
     fixed = 0
@@ -284,23 +337,52 @@ def trim_segment_edges(track, trim):
     return dropped
 
 
-def drop_large_jumps(track, max_ratio):
+def drop_large_jumps(
+    track,
+    max_ratio,
+    timestamps=None,
+    local_mad_window=0,
+    local_mad_multiplier=0.0,
+    local_mad_min_samples=4,
+):
     if max_ratio <= 0:
         return 0
-    dropped = 0
+    nominal_dt = _nominal_dt(timestamps)
+    ratios = np.full((len(track),), np.nan, dtype=np.float64)
     prev = None
     prev_idx = None
     for i, hand in enumerate(track):
         if hand is None:
             continue
         if prev is not None:
-            ratio = normalized_distance(hand, prev, i - prev_idx)
-            if ratio is not None and ratio > max_ratio:
-                track[i] = None
-                dropped += 1
-                continue
+            ratio = normalized_velocity(
+                hand,
+                prev,
+                prev_idx,
+                i,
+                timestamps=timestamps,
+                nominal_dt=nominal_dt,
+            )
+            if ratio is not None:
+                ratios[i] = ratio
         prev = hand
         prev_idx = i
+
+    dropped = 0
+    for i, ratio in enumerate(ratios):
+        if not np.isfinite(ratio) or ratio <= max_ratio:
+            continue
+        local_threshold = _local_mad_threshold(
+            ratios,
+            i,
+            local_mad_window,
+            local_mad_multiplier,
+            local_mad_min_samples,
+        )
+        if local_threshold is not None and ratio <= local_threshold:
+            continue
+        track[i] = None
+        dropped += 1
     return dropped
 
 
@@ -410,14 +492,23 @@ def main():
     ap.add_argument("--input-jsonl", required=True, type=Path)
     ap.add_argument("--output-jsonl", required=True, type=Path)
     ap.add_argument("--max-flip-dist-ratio", type=float, default=1.5,
-                    help="Flip side if a hand is within this normalized distance to previous opposite-side track.")
+                    help="Flip side if a hand is within this normalized distance to previous opposite-side track. Use 0 to disable.")
     ap.add_argument("--flip-margin-ratio", type=float, default=0.35,
                     help="Opposite-side match must beat same-side match by this normalized margin.")
     ap.add_argument("--duplicate-dist-ratio", type=float, default=0.75,
                     help="Drop left/right detections in the same frame if their wrist distance / hand size is below this.")
-    ap.add_argument("--duplicate-mode", choices=("drop_both", "keep_best"), default="drop_both")
+    ap.add_argument("--duplicate-mode", choices=("drop_both", "keep_best"), default="keep_best")
     ap.add_argument("--max-wrist-step-hand-ratio", type=float, default=2.0,
-                    help="Drop per-side wrist jumps larger than this many hand sizes per frame. Use 0 to disable.")
+                    help=(
+                        "Drop per-side wrist jumps larger than this many hand lengths per normalized dt. "
+                        "Use 0 to disable."
+                    ))
+    ap.add_argument("--local-mad-window", type=int, default=7,
+                    help="Window size for local MAD wrist-velocity outlier check. Use 0 to disable.")
+    ap.add_argument("--local-mad-multiplier", type=float, default=6.0,
+                    help="MAD multiplier for local wrist-velocity outlier check. Use 0 to disable.")
+    ap.add_argument("--local-mad-min-samples", type=int, default=4,
+                    help="Minimum local finite wrist velocities required before applying local MAD.")
     ap.add_argument("--min-track-len", type=int, default=8,
                     help="Drop per-side continuous segments shorter than this many frames.")
     ap.add_argument("--trim-segment-edges", type=int, default=0,
@@ -476,8 +567,16 @@ def main():
     stats["trimmed_segment_edges"] = 0
     stats["recomputed_soft_fields"] = 0
     stats["dropped_low_alpha"] = 0
+    timestamps = [float(item.get("timestamp", i)) for i, item in enumerate(items)]
     for side in ("left", "right"):
-        stats["dropped_large_jumps"] += drop_large_jumps(tracks[side], args.max_wrist_step_hand_ratio)
+        stats["dropped_large_jumps"] += drop_large_jumps(
+            tracks[side],
+            args.max_wrist_step_hand_ratio,
+            timestamps=timestamps,
+            local_mad_window=args.local_mad_window,
+            local_mad_multiplier=args.local_mad_multiplier,
+            local_mad_min_samples=args.local_mad_min_samples,
+        )
         stats["dropped_short_segments"] += drop_short_segments(tracks[side], args.min_track_len)
         stats["trimmed_segment_edges"] += trim_segment_edges(tracks[side], args.trim_segment_edges)
         if args.recompute_soft_fields:

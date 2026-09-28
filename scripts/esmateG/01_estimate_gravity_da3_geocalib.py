@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
+from scipy.optimize import minimize
 
 
 # ============================================================
@@ -69,6 +70,27 @@ LOW_PRIOR_PLANES_PER_BAND = 3
 LOW_PRIOR_ACCEPT_MAX_HEIGHT_RANK = 0.35
 LOW_PRIOR_REPLACE_HEIGHT_RANK_DELTA = 0.08
 TABLETOP_RISK_HEIGHT_RANK = 0.35
+MAX_BELOW_FLOOR_RATIO = 0.05
+HAND_ABOVE_HEAD_MAX_RATIO = 0.5
+
+# Real-IMU alignment parameters.
+# With a real IMU the measured vertical drives the floor search: candidate planes
+# are looked for in the low region along that axis instead of anywhere in the cloud.
+# Connected patches are refined with the normal constrained to the configured
+# IMU cone; the non-IMU path retains its original covariance refinement.
+IMU_LOW_PERCENTILES = [2.0, 5.0, 8.0, 12.0, 18.0]
+IMU_PLANES_PER_BAND = 8
+IMU_FLOOR_MIN_INLIERS_ABS = 60
+IMU_FLOOR_MIN_INLIER_RATIO = 0.004
+IMU_FLOOR_CONNECTIVITY_VOXELS = 3.0
+IMU_FLOOR_MIN_AREA_VOXELS = 64.0
+IMU_FLOOR_MIN_RETAINED_RATIO = 0.7
+IMU_MAX_REFINE_ANGLE_DEG = 10.0
+IMU_MIN_CAMERA_ABOVE_HAND_RATIO = 0.5
+IMU_MAX_HEAD_HEIGHT_REL_SPREAD = 0.75
+IMU_MAX_POINTS_BELOW_FLOOR_RATIO = 0.05
+IMU_MIN_HEAD_SPAN_RATIO = 0.15
+IMU_MAX_HEAD_SPAN_RATIO = 2.50
 
 
 
@@ -464,6 +486,193 @@ def load_da3_poses_c2w(path):
     return np.stack(Ts, axis=0)
 
 
+def load_timestamps_txt(path):
+    """Load frame_id/timestamp columns from timestamps.txt."""
+    if path is None:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        table = np.genfromtxt(path, names=True, dtype=None, encoding="utf-8")
+    except Exception:
+        return None
+    if table is None or "timestamp" not in table.dtype.names or "frame_id" not in table.dtype.names:
+        return None
+    return {
+        "frame_ids": np.asarray(table["frame_id"], dtype=np.int64).reshape(-1),
+        "timestamps": np.asarray(table["timestamp"], dtype=np.float64).reshape(-1),
+    }
+
+
+def load_hand_frames(path):
+    """Load per-frame world-space hand keypoints from a HaWoR hands JSONL file."""
+    if path is None:
+        return []
+    path = Path(path)
+    if not path.is_file():
+        print(f"[Warning] hands jsonl not found: {path}; skipping head/hand height check", flush=True)
+        return []
+
+    frames = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+
+            frame_keypoints = []
+            for hand in rec.get("hands", []):
+                keypoints = hand.get("world_keypoints_3d")
+                if keypoints is None:
+                    continue
+                arr = np.asarray(keypoints, dtype=np.float64).reshape(-1, 3)
+                arr = arr[np.isfinite(arr).all(axis=1)]
+                if arr.shape[0] > 0:
+                    frame_keypoints.append(arr)
+
+            if frame_keypoints:
+                frames.append(
+                    {
+                        "timestamp": float(rec.get("timestamp", float("nan"))),
+                        "frame_id": rec.get("frame_id"),
+                        "keypoints": np.concatenate(frame_keypoints, axis=0),
+                    }
+                )
+    return frames
+
+
+def match_head_index(hand_frame, cam_centers, head_timestamps):
+    n = len(cam_centers)
+    frame_id = hand_frame.get("frame_id")
+
+    if head_timestamps is not None and frame_id is not None:
+        frame_ids = np.asarray(head_timestamps.get("frame_ids", []), dtype=np.int64)
+        matches = np.flatnonzero(frame_ids == int(frame_id))
+        if matches.size > 0:
+            return int(matches[0])
+
+    ts = hand_frame.get("timestamp")
+    if head_timestamps is not None and np.isfinite(ts):
+        timestamps = np.asarray(head_timestamps.get("timestamps", []), dtype=np.float64)
+        if len(timestamps) == n:
+            return int(np.argmin(np.abs(timestamps - ts)))
+
+    if frame_id is not None:
+        idx = int(frame_id)
+        if 0 <= idx < n:
+            return idx
+    return None
+
+
+def hand_above_head_stats(hand_frames, cam_centers, head_timestamps, floor_center, up):
+    """Measure whether hands sit above their own frame's head/camera."""
+    if not hand_frames or cam_centers is None or len(cam_centers) == 0:
+        return {"available": False, "hand_above_head_ratio": None, "num_hand_frames": 0}
+
+    cam_centers = np.asarray(cam_centers, dtype=np.float64)
+    floor_center = np.asarray(floor_center, dtype=np.float64).reshape(3)
+    up = normalize(up)
+
+    per_frame_ratios = []
+    matched_frames = 0
+    for hand_frame in hand_frames:
+        head_idx = match_head_index(hand_frame, cam_centers, head_timestamps)
+        if head_idx is None:
+            continue
+        head_height = float((cam_centers[head_idx] - floor_center) @ up)
+        hand_height = (hand_frame["keypoints"] - floor_center) @ up
+        per_frame_ratios.append(float(np.mean(hand_height > head_height)))
+        matched_frames += 1
+
+    if not per_frame_ratios:
+        return {"available": False, "hand_above_head_ratio": None, "num_hand_frames": 0}
+
+    hand_above = float(np.mean(per_frame_ratios))
+    return {
+        "available": True,
+        "hand_above_head_ratio": hand_above,
+        "num_hand_frames": matched_frames,
+        "per_frame_ratio_mean": hand_above,
+    }
+
+
+def validate_head_above_hands(hand_stats):
+    if not hand_stats.get("available", False):
+        return True, hand_stats.get("reason", "no_hand_height_data")
+    ratio = float(hand_stats.get("hand_above_head_ratio", 1.0))
+    if ratio >= HAND_ABOVE_HEAD_MAX_RATIO:
+        return (
+            False,
+            f"hand_above_head_ratio_too_high: {ratio:.6g} >= {HAND_ABOVE_HEAD_MAX_RATIO:.6g}",
+        )
+    return True, "valid"
+
+
+def resolve_imu_up_sign_with_hands(
+    axis_up,
+    hand_frames,
+    cam_centers,
+    head_timestamps,
+    min_camera_above_hand_ratio,
+):
+    """Flip IMU up only when matched hands are mostly above the camera."""
+    axis_up = normalize(axis_up)
+    if not hand_frames or cam_centers is None or len(cam_centers) == 0:
+        return axis_up, {
+            "resolved": True,
+            "reason": "no_hand_data_keep_device_convention",
+            "flipped_from_input": False,
+            "camera_above_hand_ratio": None,
+            "threshold": float(min_camera_above_hand_ratio),
+            "num_hand_frames": 0,
+        }
+
+    cam_centers = np.asarray(cam_centers, dtype=np.float64)
+    per_frame_ratios = []
+    matched_frames = 0
+    total_keypoints = 0
+    for hand_frame in hand_frames:
+        head_idx = match_head_index(hand_frame, cam_centers, head_timestamps)
+        if head_idx is None:
+            continue
+        head_height = float(cam_centers[head_idx] @ axis_up)
+        hand_height = np.asarray(hand_frame["keypoints"], dtype=np.float64) @ axis_up
+        hand_height = hand_height[np.isfinite(hand_height)]
+        if len(hand_height) == 0:
+            continue
+        per_frame_ratios.append(float(np.mean(head_height > hand_height)))
+        matched_frames += 1
+        total_keypoints += int(len(hand_height))
+
+    if not per_frame_ratios:
+        return axis_up, {
+            "resolved": True,
+            "reason": "no_matched_hand_frames_keep_device_convention",
+            "flipped_from_input": False,
+            "camera_above_hand_ratio": None,
+            "threshold": float(min_camera_above_hand_ratio),
+            "num_hand_frames": 0,
+        }
+
+    ratio = float(np.mean(per_frame_ratios))
+    flipped = ratio < min_camera_above_hand_ratio
+    return normalize(-axis_up if flipped else axis_up), {
+        "resolved": True,
+        "reason": "camera_above_hands_failed_flip" if flipped else "camera_above_hands_pass",
+        "flipped_from_input": bool(flipped),
+        "camera_above_hand_ratio": ratio,
+        "hand_above_camera_ratio": float(1.0 - ratio),
+        "threshold": float(min_camera_above_hand_ratio),
+        "num_hand_frames": int(matched_frames),
+        "num_hand_keypoints": int(total_keypoints),
+    }
+
+
 # ============================================================
 # Point cloud loading and scale-adaptive parameters
 # ============================================================
@@ -592,7 +801,16 @@ def plane_inlier_area(P_in, center, normal):
     return float(max(ru, 0.0) * max(rv, 0.0))
 
 
-def detect_plane_candidates(P, params):
+def detect_plane_candidates(P, params, cam_centers=None):
+    """
+    Fit up to N_PLANES valid floor candidates.
+
+    A candidate is invalid when the chosen up direction leaves at least one
+    camera center below the plane. Invalid candidates are removed from the
+    working point cloud and do not consume one of the N_PLANES slots, so the
+    loop keeps fitting until N_PLANES valid candidates are found or the point
+    cloud is exhausted.
+    """
     pcd_work = o3d.geometry.PointCloud()
     pcd_work.points = o3d.utility.Vector3dVector(P)
 
@@ -600,7 +818,7 @@ def detect_plane_candidates(P, params):
     min_inliers = max(MIN_INLIERS_ABS, int(total_points * MIN_INLIER_RATIO))
     candidates = []
 
-    for plane_idx in range(N_PLANES):
+    while len(candidates) < N_PLANES and len(pcd_work.points) >= min_inliers:
         if len(pcd_work.points) < min_inliers:
             break
 
@@ -623,15 +841,33 @@ def detect_plane_candidates(P, params):
         n_refined, center, rms = fit_normal_by_covariance(P_in, prefer_dir=n_ransac)
         area = plane_inlier_area(P_in, center, n_refined)
 
-        candidates.append({
-            "idx": plane_idx,
+        plane = {
+            "idx": len(candidates),
             "normal": n_refined,
             "center": center,
             "inliers": int(len(inliers)),
             "ratio": float(len(inliers) / total_points),
             "rms": rms,
             "area": area,
-        })
+        }
+
+        up, _, _ = choose_up_direction(P, plane, cam_centers, params)
+        invalid_camera = (
+            cam_centers is not None
+            and len(cam_centers) > 0
+            and np.any((cam_centers - center) @ up < 0.0)
+        )
+        if invalid_camera:
+            print(
+                "[Warning] Rejecting plane candidate: camera centers are below "
+                f"the fitted plane along the chosen up direction (inliers={len(inliers)}). "
+                "This plane is not counted towards the valid plane budget.",
+                flush=True,
+            )
+            pcd_work = pcd_work.select_by_index(inliers, invert=True)
+            continue
+
+        candidates.append(plane)
 
         pcd_work = pcd_work.select_by_index(inliers, invert=True)
 
@@ -720,6 +956,9 @@ def select_floor_plane(
     params,
     up_prior=None,
     strong_prior=False,
+    reject_camera_below_floor=False,
+    hand_frames=None,
+    head_timestamps=None,
 ):
     """
     Select the most likely floor among multiple RANSAC planes.
@@ -739,6 +978,13 @@ def select_floor_plane(
             up_prior=up_prior,
             prior_weight=sign_prior_weight,
         )
+        if (
+            reject_camera_below_floor
+            and cam_centers is not None
+            and len(cam_centers) > 0
+            and np.any((cam_centers - plane["center"]) @ up < 0.0)
+        ):
+            continue
 
         # Inlier count helps, but log avoids a large wall dominating everything.
         inlier_score = 1.2 * np.log1p(plane["inliers"])
@@ -758,18 +1004,33 @@ def select_floor_plane(
             if strong_prior and angle_to_prior > GEOCALIB_PRIOR_MAX_ANGLE_DEG:
                 score -= 4.0 * (angle_to_prior - GEOCALIB_PRIOR_MAX_ANGLE_DEG)
 
+        hand_stats = hand_above_head_stats(hand_frames, cam_centers, head_timestamps, plane["center"], up)
+        hand_height_valid, hand_height_reason = validate_head_above_hands(hand_stats)
+        if not hand_height_valid:
+            print(
+                "[Warning] Rejecting plane candidate: head/hand height check failed: "
+                f"{hand_height_reason}",
+                flush=True,
+            )
+            continue
+
         item = dict(plane)
         item.update({
             "up": up,
             "score": float(score),
             "sign_stats": stats,
             "angle_to_prior_deg": angle_to_prior,
+            "hand_above_head": hand_stats,
+            "hand_height_valid": bool(hand_height_valid),
+            "hand_height_reason": str(hand_height_reason),
         })
 
         if score > best_score:
             best_score = score
             best = item
 
+    if best is None:
+        raise RuntimeError("No floor candidate passed camera/head/hand height checks.")
     return best
 
 
@@ -853,7 +1114,7 @@ def detect_low_prior_plane_candidates(P, params, up_prior):
     return candidates
 
 
-def select_low_prior_floor_plane(P, cam_centers, params, up_prior):
+def select_low_prior_floor_plane(P, cam_centers, params, up_prior, hand_frames=None, head_timestamps=None):
     """
     Pick the lowest plausible plane whose normal agrees with GeoCalib up.
     """
@@ -900,6 +1161,11 @@ def select_low_prior_floor_plane(P, cam_centers, params, up_prior):
             - rms_penalty
         )
 
+        hand_stats = hand_above_head_stats(hand_frames, cam_centers, head_timestamps, plane["center"], up)
+        hand_height_valid, hand_height_reason = validate_head_above_hands(hand_stats)
+        if not hand_height_valid:
+            continue
+
         item = dict(plane)
         item.update({
             "up": up,
@@ -907,11 +1173,21 @@ def select_low_prior_floor_plane(P, cam_centers, params, up_prior):
             "sign_stats": stats,
             "angle_to_prior_deg": angle_to_prior,
             "min_refine_inliers": LOW_PRIOR_MIN_INLIERS_ABS,
+            "hand_above_head": hand_stats,
+            "hand_height_valid": bool(hand_height_valid),
+            "hand_height_reason": str(hand_height_reason),
         })
 
         if score > best_score:
             best_score = score
             best = item
+
+    if best is None:
+        return None, {
+            "num_candidates": int(len(candidates)),
+            "method": "geocalib_low_prior",
+            "fallback_reason": "no low prior plane candidates passed head/hand height checks",
+        }
 
     stats = {
         "num_candidates": int(len(candidates)),
@@ -1115,8 +1391,11 @@ def floor_position_stats(P, floor_center, up, params):
     signed = heights - center_height
     height_rank = float(np.mean(heights < center_height))
     below_margin_ratio = float(np.mean(signed < -margin))
-    low_position_valid = height_rank <= LOW_PRIOR_ACCEPT_MAX_HEIGHT_RANK
-    tabletop_risk = height_rank > TABLETOP_RISK_HEIGHT_RANK and below_margin_ratio > 0.05
+    low_position_valid = (
+        height_rank <= LOW_PRIOR_ACCEPT_MAX_HEIGHT_RANK
+        and below_margin_ratio <= MAX_BELOW_FLOOR_RATIO
+    )
+    tabletop_risk = below_margin_ratio > MAX_BELOW_FLOOR_RATIO
 
     return {
         "available": True,
@@ -1127,6 +1406,7 @@ def floor_position_stats(P, floor_center, up, params):
         "tabletop_risk": bool(tabletop_risk),
         "max_valid_height_rank": LOW_PRIOR_ACCEPT_MAX_HEIGHT_RANK,
         "tabletop_risk_height_rank": TABLETOP_RISK_HEIGHT_RANK,
+        "max_below_margin_ratio": MAX_BELOW_FLOOR_RATIO,
     }
 
 
@@ -1154,6 +1434,451 @@ def should_replace_with_low_prior_floor(
 
     return False, "ransac_floor_already_low_enough"
 
+
+# ============================================================
+# Real-IMU trusted alignment
+# ============================================================
+
+def estimate_up_from_imu(imu_path, Ts_c2w, vector_type="up", outlier_angle_deg=180.0):
+    """
+    Convert the real-IMU vertical vector from camera frame to a DA3-world axis.
+
+    04_prepare_real_sensor_inputs.py writes a single row "frame_id gx gy gz" with
+    the median accelerometer reading rotated into the camera frame. For a mostly
+    stationary head this is the upward specific-force direction, so the default
+    vector type here is "up" rather than the GeoCalib "gravity" convention.
+    """
+    up_imu, stats = estimate_up_from_geocalib(
+        imu_path,
+        Ts_c2w,
+        vector_type=vector_type,
+        outlier_angle_deg=outlier_angle_deg,
+    )
+    stats = dict(stats)
+    stats["imu_path"] = stats.pop("path", str(imu_path))
+    stats["source"] = "real_imu"
+    return up_imu, stats
+
+
+def fit_plane_with_imu_constraint(P, up, max_angle_deg):
+    """Minimize orthogonal plane error inside the IMU normal cone, not after it."""
+    if not np.isfinite(max_angle_deg) or not 0 <= max_angle_deg < 90:
+        raise ValueError("IMU plane angle limit must be finite and in [0, 90)")
+    up = normalize(up)
+    free_normal, center, _ = fit_normal_by_covariance(P, prefer_dir=up)
+    if angle_deg(free_normal, up) <= max_angle_deg:
+        return free_normal, center
+    if max_angle_deg == 0:
+        return up, center
+    u, v = make_plane_basis(up)
+    basis = np.stack([u, v, up], axis=1)
+    local = (P - center) @ basis
+    covariance = local.T @ local
+    covariance /= max(float(np.trace(covariance)), 1e-12)
+    radius = np.tan(np.deg2rad(max_angle_deg)) * (1.0 - 1e-7)
+
+    def objective(slope):
+        q = np.r_[-slope, 1.0]
+        cq = covariance @ q
+        norm2 = 1.0 + slope @ slope
+        value = q @ cq
+        gradient = -2.0 * cq[:2] / norm2 - 2.0 * slope * value / norm2 ** 2
+        return value / norm2, gradient
+
+    result = minimize(objective, np.zeros(2), jac=True, method="SLSQP",
+        constraints={"type": "ineq", "fun": lambda s: radius ** 2 - s @ s,
+                     "jac": lambda s: -2.0 * s},
+        options={"ftol": 1e-12, "maxiter": 100})
+    normal = normalize(basis @ np.r_[-result.x, 1.0])
+    if not result.success or angle_deg(normal, up) > max_angle_deg:
+        raise ValueError("IMU-constrained plane solve did not converge within the angle limit")
+    return normal, center
+
+
+def refine_imu_floor_patch(P, up, params, max_angle_deg, min_inliers):
+    """A bounded normal is useful only when it still explains a broad patch."""
+    mask = np.ones(len(P), dtype=bool)
+    minimum = max(min_inliers, int(np.ceil(len(P) * IMU_FLOOR_MIN_RETAINED_RATIO)))
+    for threshold in params["refine_thresholds"][:REFINE_ITERS]:
+        normal, center = fit_plane_with_imu_constraint(P[mask], up, max_angle_deg)
+        mask = np.abs((P - center) @ normal) < min(threshold, params["distance_threshold"])
+        if int(mask.sum()) < minimum:
+            raise ValueError("constrained_plane_loses_support")
+    support = P[mask]
+    rms = float(np.sqrt(np.mean(((support - center) @ normal) ** 2)))
+    u, v = make_plane_basis(normal)
+    widths = [robust_percentile_range(support @ axis) for axis in (u, v)]
+    area = float(np.prod(widths))
+    voxel = params["voxel_size"]
+    if min(widths) < 3.0 * voxel or area < IMU_FLOOR_MIN_AREA_VOXELS * voxel ** 2:
+        raise ValueError("connected_patch_has_insufficient_coverage")
+    if rms > 0.65 * params["distance_threshold"]:
+        raise ValueError("constrained_plane_residual_too_large")
+    return normal, center, mask, rms, area
+
+
+def find_low_floor_candidates_along_imu_axis(
+    P, up, params, cam_centers=None, *, max_refine_angle_deg=IMU_MAX_REFINE_ANGLE_DEG,
+):
+    """
+    Collect floor candidates in the low region of the cloud along the IMU axis.
+
+    Scan bands from bottom to top. Within each band, peel off each fitted plane
+    before looking for the next one, so a rejected plane cannot monopolize the
+    search. Connected patches are fitted inside the IMU normal cone; insufficient
+    coverage, residual or retained support excludes a patch from the candidates.
+    Both fitting and refinement stay inside the candidate's support.
+    Search stops before a band reaches the minimum camera height.
+
+    Returns:
+        candidates (percentile, then supported plane height), search_stats
+    """
+    up = normalize(up)
+    P = np.asarray(P, dtype=np.float64)
+    heights = P @ up
+    cam_height_limit = None
+    if cam_centers is not None and len(cam_centers) > 0:
+        cam_heights = np.asarray(cam_centers, dtype=np.float64) @ up
+        cam_heights = cam_heights[np.isfinite(cam_heights)]
+        if len(cam_heights) > 0:
+            cam_height_limit = float(np.min(cam_heights))
+    total_points = len(P)
+    extent2 = params["scene_extent"] ** 2 + 1e-12
+    connection_radius = IMU_FLOOR_CONNECTIVITY_VOXELS * params["voxel_size"]
+
+    found = []
+    tried = []
+    o3d.utility.random.seed(RANDOM_SEED)
+
+    for percentile in IMU_LOW_PERCENTILES:
+        cutoff = float(np.percentile(heights, percentile))
+        if cam_height_limit is not None and cutoff >= cam_height_limit:
+            tried.append({
+                "low_percentile": float(percentile),
+                "status": "stopped_at_camera_min_height",
+                "cutoff": float(cutoff),
+                "min_camera_height": float(cam_height_limit),
+            })
+            break
+        remaining = np.flatnonzero(heights <= cutoff)
+        min_inliers = max(IMU_FLOOR_MIN_INLIERS_ABS,
+                          int(len(remaining) * IMU_FLOOR_MIN_INLIER_RATIO))
+        if len(remaining) < min_inliers:
+            tried.append({
+                "low_percentile": float(percentile),
+                "status": "band_too_small",
+                "band_points": int(len(remaining)),
+            })
+            continue
+
+        for plane_index in range(IMU_PLANES_PER_BAND):
+            if len(remaining) < max(min_inliers, RANSAC_N):
+                break
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(P[remaining])
+            _, local_inliers = pcd.segment_plane(
+                distance_threshold=params["distance_threshold"],
+                ransac_n=RANSAC_N,
+                num_iterations=RANSAC_ITERATIONS,
+            )
+            if len(local_inliers) < min_inliers:
+                tried.append({
+                    "low_percentile": float(percentile),
+                    "plane_in_band": plane_index + 1,
+                    "status": "too_few_inliers",
+                    "inliers": len(local_inliers),
+                })
+                break
+
+            plane_indices = remaining[local_inliers]
+            keep = np.ones(len(remaining), dtype=bool)
+            keep[local_inliers] = False
+            remaining = remaining[keep]
+            pcd.points = o3d.utility.Vector3dVector(P[plane_indices])
+            labels = np.asarray(pcd.cluster_dbscan(eps=connection_radius, min_points=3))
+            component_ids, counts = np.unique(labels[labels >= 0], return_counts=True)
+            supported = component_ids[counts >= min_inliers]
+            if not len(supported):
+                tried.append({"low_percentile": float(percentile), "plane_in_band": plane_index + 1,
+                              "status": "no_connected_patch_with_enough_points", "inliers": len(plane_indices)})
+            for component_id in supported:
+                indices = plane_indices[labels == component_id]
+                try:
+                    normal, center, mask, rms, area = refine_imu_floor_patch(
+                        P[indices], up, params, max_refine_angle_deg, min_inliers)
+                except ValueError as exc:
+                    tried.append({"low_percentile": float(percentile), "plane_in_band": plane_index + 1,
+                                  "component": int(component_id), "status": str(exc), "inliers": len(indices)})
+                    continue
+                floor_mask = np.zeros(total_points, dtype=bool)
+                floor_mask[indices[mask]] = True
+                level = float(center @ up)
+                height_rank = float(np.mean(heights < level))
+                inliers = int(mask.sum())
+                score = 32.0 * (1.0 - height_rank) + float(np.log1p(inliers))
+                score += 3.0 * float(np.tanh(area / (0.06 * extent2)))
+                score -= 2.0 * rms / params["distance_threshold"]
+                item = {
+                    "low_percentile": float(percentile), "plane_in_band": plane_index + 1,
+                    "component": int(component_id), "cutoff": cutoff, "status": "ok",
+                    "level": level, "inliers": inliers, "inlier_ratio": float(inliers / max(total_points, 1)),
+                    "area": area, "rms": rms, "height_rank": height_rank, "score": score,
+                    "normal": normal.tolist(), "method": "imu_low_connected_constrained_plane",
+                    "min_inliers": int(min_inliers), "retained_support_ratio": float(mask.mean()),
+                    "angle_to_imu_deg": angle_deg(normal, up),
+                }
+                tried.append(dict(item))
+                item.update(mask=floor_mask, center=center)
+                found.append(item)
+
+    candidates = sorted(found, key=lambda c: (c["low_percentile"], c["level"], -c["inliers"]))
+
+    search_stats = {
+        "num_candidates": int(len(candidates)),
+        "num_raw_candidates": int(len(found)),
+        "min_inliers": IMU_FLOOR_MIN_INLIERS_ABS,
+        "support_count_policy": "low_band_fraction_and_absolute_minimum",
+        "connection_radius": connection_radius,
+        "min_patch_area": IMU_FLOOR_MIN_AREA_VOXELS * params["voxel_size"] ** 2,
+        "max_refine_angle_deg": float(max_refine_angle_deg),
+        "max_planes_per_band": IMU_PLANES_PER_BAND,
+        "bands": tried,
+        "candidate_levels": [float(c["level"]) for c in candidates],
+        "min_camera_height": cam_height_limit,
+    }
+    return candidates, search_stats
+
+
+def refined_floor_stats(P, floor_mask, floor_center, up, params):
+    """Support statistics for a floor plane after coarse-to-fine refinement."""
+    up = normalize(up)
+    P = np.asarray(P, dtype=np.float64)
+    floor_center = np.asarray(floor_center, dtype=np.float64).reshape(3)
+
+    if floor_mask is None:
+        floor_mask = np.abs((P - floor_center) @ up) < float(params["distance_threshold"])
+
+    P_in = P[floor_mask]
+    inliers = int(len(P_in))
+    if inliers < 3:
+        return {
+            "inliers": inliers,
+            "inlier_ratio": float(inliers / max(len(P), 1)),
+            "area": 0.0,
+            "rms": float("nan"),
+        }
+
+    signed = (P_in - floor_center) @ up
+    return {
+        "inliers": inliers,
+        "inlier_ratio": float(inliers / max(len(P), 1)),
+        "area": float(plane_inlier_area(P_in, floor_center, up)),
+        "rms": float(np.sqrt(np.mean(signed ** 2))),
+    }
+
+
+def imu_head_height_stats(P, cam_centers, floor_center, up, params):
+    """
+    Head-height diagnostics for the IMU-trusted floor, in scale-free form.
+
+    This stage runs before metric scaling, so absolute meters are not available.
+    The extra fields are ratios: head-height spread relative to the median head
+    height, and median head height relative to the vertical span of the scene.
+    """
+    stats = camera_height_stats(cam_centers, floor_center, up, params)
+    if not stats.get("available", False):
+        return stats
+
+    up = normalize(up)
+    heights = np.asarray(P, dtype=np.float64) @ up
+    heights = heights[np.isfinite(heights)]
+    span = float(np.percentile(heights, 99.0) - np.percentile(heights, 1.0)) if len(heights) else 0.0
+
+    median = float(stats["median"])
+    spread = float(stats["p90"] - stats["p10"])
+
+    stats["head_height_spread_p90_p10"] = spread
+    stats["head_height_rel_spread"] = float(spread / abs(median)) if abs(median) > 1e-12 else float("inf")
+    stats["scene_vertical_span"] = span
+    stats["head_span_ratio"] = float(median / span) if span > 1e-12 else float("inf")
+    return stats
+
+
+def evaluate_imu_floor_candidate(
+    P,
+    cam_centers,
+    params,
+    up_imu,
+    candidate,
+    *,
+    max_refine_angle_deg,
+    **head_height_thresholds,
+):
+    """
+    Evaluate a connected candidate already refined inside the IMU normal cone.
+    Head height is validated on the refined plane, and the refined normal is
+    compared against the IMU axis.
+    """
+    selected = {
+        "idx": 2000,
+        "normal": np.asarray(candidate["normal"], dtype=np.float64),
+        "center": np.asarray(candidate["center"], dtype=np.float64),
+        "up": np.asarray(candidate["normal"], dtype=np.float64),
+        "inliers": int(candidate["inliers"]),
+        "ratio": float(candidate["inlier_ratio"]),
+        "rms": float(candidate["rms"]),
+        "area": float(candidate["area"]),
+        "score": float(candidate["score"]),
+        "low_percentile": float(candidate["low_percentile"]),
+        "min_refine_inliers": int(candidate["min_inliers"]),
+        "selection_source": str(candidate["method"]),
+    }
+
+    up_refined = np.asarray(candidate["normal"], dtype=np.float64)
+    floor_center = np.asarray(candidate["center"], dtype=np.float64)
+    floor_mask = candidate["mask"].copy()
+    up_refined = final_sign_check(
+        P,
+        up_refined,
+        floor_center,
+        cam_centers,
+        params,
+        up_prior=up_imu,
+    )
+
+    refine_angle_deg = angle_deg(up_refined, up_imu)
+    angle_ok = refine_angle_deg <= float(max_refine_angle_deg)
+    refine_stats = refined_floor_stats(P, floor_mask, floor_center, up_refined, params)
+    refine_stats.update({
+        "angle_from_imu_axis_deg": float(refine_angle_deg),
+        "max_angle_from_imu_axis_deg": float(max_refine_angle_deg),
+        "angle_ok": bool(angle_ok),
+    })
+
+    floor_position = floor_position_stats(P, floor_center, up_refined, params)
+    head_stats = imu_head_height_stats(P, cam_centers, floor_center, up_refined, params)
+    height_valid, height_reason, height_checks = validate_imu_head_height(
+        head_stats,
+        floor_position,
+        **head_height_thresholds,
+    )
+
+    return {
+        "selected": selected,
+        "up": up_refined,
+        "floor_center": floor_center,
+        "floor_mask": floor_mask,
+        "candidate": {k: v for k, v in candidate.items() if k not in ("center", "mask")},
+        "refine": refine_stats,
+        "refine_angle_deg": float(refine_angle_deg),
+        "angle_ok": bool(angle_ok),
+        "floor_position": floor_position,
+        "head_height": head_stats,
+        "head_height_checks": height_checks,
+        "height_valid": bool(height_valid),
+        "height_reason": str(height_reason),
+    }
+
+
+def validate_imu_head_height(
+    head_stats,
+    floor_position,
+    *,
+    min_valid_camera_height_margin_factor=2.0,
+    min_camera_above_floor_ratio=0.75,
+    min_camera_p10_height_margin_factor=-2.0,
+    max_head_height_rel_spread=IMU_MAX_HEAD_HEIGHT_REL_SPREAD,
+    max_points_below_floor_ratio=IMU_MAX_POINTS_BELOW_FLOOR_RATIO,
+    min_head_span_ratio=IMU_MIN_HEAD_SPAN_RATIO,
+    max_head_span_ratio=IMU_MAX_HEAD_SPAN_RATIO,
+):
+    """
+    Decide whether the IMU-trusted floor produces a plausible head trajectory.
+
+    All criteria are scale-free because the point cloud is not metric yet:
+        1. the head must stay above the fitted floor (shared height validation)
+        2. head height must be stable, i.e. p90-p10 small against the median
+        3. almost nothing may sit below the fitted plane, so a tabletop or a
+           platform cannot pass as the floor
+        4. head height must be a sane fraction of the scene vertical span
+
+    Criterion 3 counts points more than one height_margin below the plane rather
+    than the raw height rank, so a scene dominated by floor points is not
+    rejected just because the floor slab holds most of the cloud.
+    """
+    checks = []
+
+    valid, reason = validate_camera_height_stats(
+        head_stats,
+        min_valid_camera_height_margin_factor=min_valid_camera_height_margin_factor,
+        min_camera_above_floor_ratio=min_camera_above_floor_ratio,
+        min_camera_p10_height_margin_factor=min_camera_p10_height_margin_factor,
+    )
+    checks.append({"name": "head_above_floor", "passed": bool(valid), "detail": str(reason)})
+    if not valid:
+        return False, f"head_above_floor_failed: {reason}", checks
+
+    rel_spread = float(head_stats.get("head_height_rel_spread", float("inf")))
+    spread_ok = np.isfinite(rel_spread) and rel_spread <= float(max_head_height_rel_spread)
+    checks.append({
+        "name": "head_height_stability",
+        "passed": bool(spread_ok),
+        "value": rel_spread,
+        "threshold": float(max_head_height_rel_spread),
+    })
+    if not spread_ok:
+        return (
+            False,
+            f"head_height_unstable: rel_spread={rel_spread:.6g} > {float(max_head_height_rel_spread):.6g}",
+            checks,
+        )
+
+    available = bool(floor_position.get("available", False))
+    below_ratio = float(floor_position.get("below_margin_ratio", 1.0)) if available else 1.0
+    height_rank = float(floor_position.get("height_rank", 1.0)) if available else 1.0
+    below_ok = below_ratio <= float(max_points_below_floor_ratio)
+    checks.append({
+        "name": "floor_is_lower_envelope",
+        "passed": bool(below_ok),
+        "value": below_ratio,
+        "threshold": float(max_points_below_floor_ratio),
+        "height_rank": height_rank,
+    })
+    if not below_ok:
+        return (
+            False,
+            (
+                f"imu_floor_not_low_enough: points_below_floor_ratio={below_ratio:.6g} > "
+                f"{float(max_points_below_floor_ratio):.6g} (height_rank={height_rank:.6g})"
+            ),
+            checks,
+        )
+
+    span_ratio = float(head_stats.get("head_span_ratio", float("inf")))
+    span_ok = (
+        np.isfinite(span_ratio)
+        and float(min_head_span_ratio) <= span_ratio <= float(max_head_span_ratio)
+    )
+    checks.append({
+        "name": "head_vs_scene_span",
+        "passed": bool(span_ok),
+        "value": span_ratio,
+        "min_threshold": float(min_head_span_ratio),
+        "max_threshold": float(max_head_span_ratio),
+    })
+    if not span_ok:
+        return (
+            False,
+            (
+                f"head_span_ratio_out_of_range: {span_ratio:.6g} not in "
+                f"[{float(min_head_span_ratio):.6g}, {float(max_head_span_ratio):.6g}]"
+            ),
+            checks,
+        )
+
+    return True, "valid", checks
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -1162,6 +1887,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pcd", required=True, help="Input DA3 combined_pcd.ply")
     parser.add_argument("--poses", required=True, help="Input DA3 camera_poses.txt, fixed as c2w")
+    parser.add_argument(
+        "--hands-jsonl",
+        default=None,
+        help="Optional HaWoR hands JSONL in the same world frame as --poses, for the head/hand height check.",
+    )
+    parser.add_argument(
+        "--timestamps",
+        default=None,
+        help="Optional timestamps.txt aligned with --poses, used to match hand frames to head frames.",
+    )
     parser.add_argument("--out", default="R_align.npy", help="Output rotation matrix .npy")
     parser.add_argument(
         "--out_meta",
@@ -1193,6 +1928,79 @@ def main():
         type=float,
         default=GEOCALIB_OUTLIER_ANGLE_DEG,
         help="Per-frame GeoCalib world-up outlier rejection threshold",
+    )
+    parser.add_argument(
+        "--imu_gravity",
+        default=None,
+        help=(
+            "Real IMU vertical vector in camera frame (tmp/imu_gravity.txt). "
+            "When given, the IMU axis is trusted: the floor normal is locked to it "
+            "and only the floor offset is fitted from low scene points. GeoCalib "
+            "options are ignored in this mode."
+        ),
+    )
+    parser.add_argument(
+        "--imu_vector_type",
+        default="up",
+        choices=["gravity", "down", "g", "up", "upright"],
+        help=(
+            "How to read imu_gravity.txt. Default is up because the file stores the "
+            "median accelerometer specific force, which points upward at rest. The "
+            "device convention gives the initial sign; matched hand data may flip it "
+            "when the camera is not above the hands."
+        ),
+    )
+    parser.add_argument(
+        "--imu_min_camera_above_hand_ratio",
+        type=float,
+        default=IMU_MIN_CAMERA_ABOVE_HAND_RATIO,
+        help=(
+            "In real-IMU mode, flip the IMU up sign when matched camera/head height "
+            "is above hand keypoints in less than this ratio."
+        ),
+    )
+    parser.add_argument(
+        "--imu_outlier_angle_deg",
+        type=float,
+        default=180.0,
+        help="Per-sample IMU outlier rejection threshold. The file normally holds one vector.",
+    )
+    parser.add_argument(
+        "--imu_max_refine_angle_deg",
+        type=float,
+        default=IMU_MAX_REFINE_ANGLE_DEG,
+        help=(
+            "Max angle between the IMU axis and the floor normal re-estimated from the "
+            "point cloud. Beyond this the IMU result is marked rejected so the main "
+            "pipeline can skip EgoGVAE inference."
+        ),
+    )
+    parser.add_argument(
+        "--imu_max_head_height_rel_spread",
+        type=float,
+        default=IMU_MAX_HEAD_HEIGHT_REL_SPREAD,
+        help="Max (p90-p10)/median of head height above the IMU floor.",
+    )
+    parser.add_argument(
+        "--imu_max_points_below_floor_ratio",
+        type=float,
+        default=IMU_MAX_POINTS_BELOW_FLOOR_RATIO,
+        help=(
+            "Max fraction of scene points more than one height_margin below the IMU "
+            "floor plane. Keeps a tabletop or a platform from passing as the floor."
+        ),
+    )
+    parser.add_argument(
+        "--imu_min_head_span_ratio",
+        type=float,
+        default=IMU_MIN_HEAD_SPAN_RATIO,
+        help="Min median head height as a fraction of the scene vertical span.",
+    )
+    parser.add_argument(
+        "--imu_max_head_span_ratio",
+        type=float,
+        default=IMU_MAX_HEAD_SPAN_RATIO,
+        help="Max median head height as a fraction of the scene vertical span.",
     )
     parser.add_argument(
         "--geocalib_precheck_height",
@@ -1229,6 +2037,8 @@ def main():
         help="Minimum p10 camera height as a multiple of auto height_margin.",
     )
     args = parser.parse_args()
+    if not 0.0 <= args.imu_min_camera_above_hand_ratio <= 1.0:
+        raise ValueError("--imu_min_camera_above_hand_ratio must be in [0, 1]")
 
     P_full = load_point_cloud(args.pcd)
     params = compute_auto_params(P_full)
@@ -1236,17 +2046,42 @@ def main():
 
     Ts = load_da3_poses_c2w(args.poses)
     cam_centers = Ts[:, :3, 3]
+    hand_frames = load_hand_frames(args.hands_jsonl)
+    head_timestamps = load_timestamps_txt(args.timestamps)
 
-    candidates = detect_plane_candidates(P, params)
+    imu_mode = args.imu_gravity is not None
 
-    # Stage 1: original DA3 point-cloud-only RANSAC selection.
-    selected_ransac = select_floor_plane(P, candidates, cam_centers, params)
-    up_ransac, floor_center_ransac, floor_mask_ransac = refine_floor_coarse_to_fine(
-        P,
-        selected_ransac,
-        params,
-    )
-    up_ransac = final_sign_check(P, up_ransac, floor_center_ransac, cam_centers, params)
+    # Stage 1: original DA3 point-cloud-only RANSAC selection. It is only used
+    # when no real IMU is available; real-IMU mode must not precompute or fall
+    # back to this global point-cloud direction.
+    candidates = None
+    selected_ransac = None
+    up_ransac = None
+    floor_center_ransac = None
+    floor_mask_ransac = None
+    ransac_error = None
+    if not imu_mode:
+        try:
+            candidates = detect_plane_candidates(P, params, cam_centers)
+            selected_ransac = select_floor_plane(
+                P,
+                candidates,
+                cam_centers,
+                params,
+                reject_camera_below_floor=True,
+                hand_frames=hand_frames,
+                head_timestamps=head_timestamps,
+            )
+            up_ransac, floor_center_ransac, floor_mask_ransac = refine_floor_coarse_to_fine(
+                P,
+                selected_ransac,
+                params,
+            )
+            up_ransac = final_sign_check(P, up_ransac, floor_center_ransac, cam_centers, params)
+        except RuntimeError:
+            raise
+    else:
+        ransac_error = "skipped_in_real_imu_mode"
 
     up_geocalib = None
     up_geocalib_raw = None
@@ -1268,24 +2103,36 @@ def main():
     floor_center = floor_center_ransac
     floor_mask = floor_mask_ransac
 
-    ransac_camera_height_stats = camera_height_stats(
-        cam_centers,
-        floor_center_ransac,
-        up_ransac,
-        params,
-    )
-    ransac_height_valid, ransac_height_reason = validate_camera_height_stats(
-        ransac_camera_height_stats,
-        min_valid_camera_height_margin_factor=args.min_valid_camera_height_margin_factor,
-        min_camera_above_floor_ratio=args.min_camera_above_floor_ratio,
-        min_camera_p10_height_margin_factor=args.min_camera_p10_height_margin_factor,
-    )
-    ransac_floor_position_stats = floor_position_stats(
-        P,
-        floor_center_ransac,
-        up_ransac,
-        params,
-    )
+    if up_ransac is not None:
+        ransac_camera_height_stats = camera_height_stats(
+            cam_centers,
+            floor_center_ransac,
+            up_ransac,
+            params,
+        )
+        ransac_height_valid, ransac_height_reason = validate_camera_height_stats(
+            ransac_camera_height_stats,
+            min_valid_camera_height_margin_factor=args.min_valid_camera_height_margin_factor,
+            min_camera_above_floor_ratio=args.min_camera_above_floor_ratio,
+            min_camera_p10_height_margin_factor=args.min_camera_p10_height_margin_factor,
+        )
+        ransac_floor_position_stats = floor_position_stats(
+            P,
+            floor_center_ransac,
+            up_ransac,
+            params,
+        )
+    else:
+        ransac_camera_height_stats = {
+            "available": False,
+            "reason": f"ransac_baseline_unavailable: {ransac_error}",
+        }
+        ransac_height_valid = False
+        ransac_height_reason = f"ransac_baseline_unavailable: {ransac_error}"
+        ransac_floor_position_stats = {
+            "available": False,
+            "reason": f"ransac_baseline_unavailable: {ransac_error}",
+        }
     final_floor_position_stats = ransac_floor_position_stats
 
     geocalib_precheck_height_stats = {}
@@ -1298,8 +2145,290 @@ def main():
     fallback_reason = None
     decision_reason = "no_geocalib_prior_use_ransac"
 
-    # Stage 2: optional GeoCalib appearance-based gravity prior.
-    if args.geocalib_gravity is not None:
+    up_imu = None
+    up_imu_raw = None
+    imu_stats = {}
+    used_imu_gravity = False
+
+    # Stage 2A: real IMU. The measured vertical is trusted as-is. The point cloud
+    # only decides where the floor sits along that axis, and a head-height check
+    # decides whether the result is kept. GeoCalib is not involved in this mode.
+    if imu_mode:
+        decision_reason = "imu_mode_no_decision_recorded"
+        print("[IMU] Real IMU gravity provided: running IMU-trusted alignment.", flush=True)
+        print(
+            f"[IMU] vector file: {args.imu_gravity} (vector_type={args.imu_vector_type})",
+            flush=True,
+        )
+        try:
+            up_imu_raw, imu_vector_stats = estimate_up_from_imu(
+                args.imu_gravity,
+                Ts,
+                vector_type=args.imu_vector_type,
+                outlier_angle_deg=args.imu_outlier_angle_deg,
+            )
+        except (EmptyGeoCalibVectors, FileNotFoundError, ValueError, RuntimeError) as exc:
+            imu_stats = {
+                "status": "unusable",
+                "reason": str(exc),
+                "imu_path": str(args.imu_gravity),
+                "vector_type": str(args.imu_vector_type),
+            }
+            print(f"[IMU] IMU vertical unusable: {exc}", flush=True)
+            raise RuntimeError(
+                f"IMU vertical unusable ({exc}); real-IMU mode does not use "
+                "point-cloud-only RANSAC fallback."
+            ) from exc
+        else:
+            up_imu, imu_sign_stats = resolve_imu_up_sign_with_hands(
+                up_imu_raw,
+                hand_frames,
+                cam_centers,
+                head_timestamps,
+                args.imu_min_camera_above_hand_ratio,
+            )
+            imu_sign_stats["vector_type"] = str(args.imu_vector_type)
+            print(
+                f"[IMU] measured vertical in DA3 world: "
+                f"{np.array2string(np.asarray(up_imu, dtype=np.float64), precision=6)}",
+                flush=True,
+            )
+            print(
+                f"[IMU] hand-height sign check: resolved={imu_sign_stats.get('resolved')} "
+                f"flipped_from_file={imu_sign_stats.get('flipped_from_input')} "
+                f"camera_above_hand_ratio={imu_sign_stats.get('camera_above_hand_ratio')} "
+                f"threshold={imu_sign_stats.get('threshold')} "
+                f"reason={imu_sign_stats.get('reason')}",
+                flush=True,
+            )
+            # Search along the IMU axis and fit connected patches within its cone.
+            imu_floor_candidates, imu_floor_search = find_low_floor_candidates_along_imu_axis(
+                P,
+                up_imu,
+                params,
+                cam_centers=cam_centers,
+                max_refine_angle_deg=args.imu_max_refine_angle_deg,
+            )
+            print(
+                f"[IMU] low plane search along IMU axis: "
+                f"candidates={imu_floor_search['num_candidates']} "
+                f"min_inliers={imu_floor_search['min_inliers']}",
+                flush=True,
+            )
+            if not imu_floor_candidates:
+                raise RuntimeError("IMU low-plane search returned no floor candidate.")
+
+            imu_head_thresholds = {
+                "min_valid_camera_height_margin_factor": args.min_valid_camera_height_margin_factor,
+                "min_camera_above_floor_ratio": args.min_camera_above_floor_ratio,
+                "min_camera_p10_height_margin_factor": args.min_camera_p10_height_margin_factor,
+                "max_head_height_rel_spread": args.imu_max_head_height_rel_spread,
+                "max_points_below_floor_ratio": args.imu_max_points_below_floor_ratio,
+                "min_head_span_ratio": args.imu_min_head_span_ratio,
+                "max_head_span_ratio": args.imu_max_head_span_ratio,
+            }
+
+            def evaluate_candidate(index):
+                candidate = imu_floor_candidates[index]
+                evaluation = evaluate_imu_floor_candidate(
+                    P,
+                    cam_centers,
+                    params,
+                    up_imu,
+                    candidate,
+                    max_refine_angle_deg=args.imu_max_refine_angle_deg,
+                    **imu_head_thresholds,
+                )
+                head = evaluation["head_height"]
+                print(
+                    f"[IMU] candidate {index + 1}/{len(imu_floor_candidates)}: "
+                    f"method={candidate['method']} "
+                    f"band_percentile={candidate['low_percentile']:.6g} "
+                    f"plane_in_band={candidate['plane_in_band']} "
+                    f"level={candidate['level']:.6g} "
+                    f"inliers={candidate['inliers']} "
+                    f"height_rank={candidate['height_rank']:.6g}",
+                    flush=True,
+                )
+                print(
+                    "[IMU]   head height above refined floor: "
+                    f"{'pass' if evaluation['height_valid'] else 'FAIL'} "
+                    f"median={head.get('median', float('nan')):.6g} "
+                    f"p10={head.get('p10', float('nan')):.6g} "
+                    f"p90={head.get('p90', float('nan')):.6g} "
+                    f"above_floor_ratio={head.get('above_margin_ratio', float('nan')):.6g} "
+                    f"rel_spread={head.get('head_height_rel_spread', float('nan')):.6g} "
+                    f"scene_span_ratio={head.get('head_span_ratio', float('nan')):.6g} "
+                    f"reason={evaluation['height_reason']}",
+                    flush=True,
+                )
+                for check in evaluation["head_height_checks"]:
+                    verdict = "pass" if check.get("passed") else "FAIL"
+                    extra = {k: v for k, v in check.items() if k not in ("name", "passed")}
+                    print(f"[IMU]     check {check['name']}: {verdict} {extra}", flush=True)
+                print(
+                    "[IMU]   refined normal vs IMU axis: "
+                    f"{'pass' if evaluation['angle_ok'] else 'FAIL'} "
+                    f"angle={evaluation['refine_angle_deg']:.6f} deg "
+                    f"(max {float(args.imu_max_refine_angle_deg):.6g}) "
+                    f"inliers={evaluation['refine']['inliers']} "
+                    f"rms={evaluation['refine']['rms']:.6g}",
+                    flush=True,
+                )
+                return evaluation
+
+            chosen = None
+            imu_reject_reason = None
+            imu_attempts = []
+            for index in range(len(imu_floor_candidates)):
+                evaluation = evaluate_candidate(index)
+                imu_attempts.append(evaluation)
+                if not evaluation["angle_ok"]:
+                    print(
+                        "[IMU] refined normal outside the IMU angle limit; "
+                        "trying the next lower-camera-bounded candidate.",
+                        flush=True,
+                    )
+                    continue
+                if not evaluation["height_valid"]:
+                    print(
+                        "[IMU] refined normal matches the IMU axis; height checks are "
+                        "recorded as diagnostics only in real-IMU mode.",
+                        flush=True,
+                    )
+                chosen = evaluation
+                break
+
+            if chosen is None:
+                best_effort = min(imu_attempts, key=lambda a: a["refine_angle_deg"])
+                imu_reject_reason = (
+                    "no_low_plane_within_refine_angle: best_angle="
+                    f"{best_effort['refine_angle_deg']:.6f} deg > "
+                    f"{float(args.imu_max_refine_angle_deg):.6g} deg "
+                    f"over {len(imu_attempts)} candidates"
+                )
+
+            imu_valid = chosen is not None
+            evaluation = chosen if chosen is not None else best_effort
+            imu_up = evaluation["up"]
+            imu_floor_center = evaluation["floor_center"]
+            imu_floor_mask = evaluation["floor_mask"]
+            imu_selected = evaluation["selected"]
+            imu_floor_stats = evaluation["candidate"]
+            imu_floor_refine_stats = evaluation["refine"]
+            imu_floor_position_stats = evaluation["floor_position"]
+            imu_height_stats = evaluation["head_height"]
+            imu_height_checks = evaluation["head_height_checks"]
+            imu_height_valid = evaluation["height_valid"]
+            imu_height_reason = evaluation["height_reason"]
+            imu_refine_angle_deg = evaluation["refine_angle_deg"]
+            imu_refine_angle_ok = evaluation["angle_ok"]
+
+            imu_stats = {
+                "status": "ok",
+                "vector": imu_vector_stats,
+                "sign_check": imu_sign_stats,
+                "floor_search": imu_floor_search,
+                "floor_fit": imu_floor_stats,
+                "floor_refine": imu_floor_refine_stats,
+                "floor_position": imu_floor_position_stats,
+                "head_height": imu_height_stats,
+                "head_height_checks": imu_height_checks,
+                "head_height_valid": bool(imu_height_valid),
+                "head_height_reason": str(imu_height_reason),
+                "refine_angle_ok": bool(imu_refine_angle_ok),
+                "accepted": bool(imu_valid),
+                "failed_checks_reason": str(imu_reject_reason) if imu_reject_reason else None,
+                "reject_reason": None if imu_valid else str(imu_reject_reason),
+                "num_candidates_tried": int(len(imu_attempts)),
+                "attempts": [
+                    {
+                        "candidate": attempt["candidate"],
+                        "refine_angle_deg": attempt["refine_angle_deg"],
+                        "angle_ok": attempt["angle_ok"],
+                        "height_valid": attempt["height_valid"],
+                        "height_reason": attempt["height_reason"],
+                    }
+                    for attempt in imu_attempts
+                ],
+                "thresholds": {
+                    "min_valid_camera_height_margin_factor": float(args.min_valid_camera_height_margin_factor),
+                    "min_camera_above_floor_ratio": float(args.min_camera_above_floor_ratio),
+                    "min_camera_p10_height_margin_factor": float(args.min_camera_p10_height_margin_factor),
+                    "max_head_height_rel_spread": float(args.imu_max_head_height_rel_spread),
+                    "max_points_below_floor_ratio": float(args.imu_max_points_below_floor_ratio),
+                    "min_head_span_ratio": float(args.imu_min_head_span_ratio),
+                    "max_head_span_ratio": float(args.imu_max_head_span_ratio),
+                    "max_refine_angle_deg": float(args.imu_max_refine_angle_deg),
+                },
+            }
+
+            if imu_valid:
+                used_imu_gravity = True
+                up = normalize(imu_up)
+                floor_center = imu_floor_center
+                floor_mask = imu_floor_mask
+                selected = dict(imu_selected)
+                selected.update({
+                    "normal": np.asarray(imu_up, dtype=np.float64),
+                    "center": np.asarray(imu_floor_center, dtype=np.float64),
+                    "up": np.asarray(imu_up, dtype=np.float64),
+                    "inliers": int(imu_floor_refine_stats["inliers"]),
+                    "ratio": float(imu_floor_refine_stats["inlier_ratio"]),
+                    "rms": float(imu_floor_refine_stats["rms"]),
+                    "area": float(imu_floor_refine_stats["area"]),
+                    "angle_to_prior_deg": float(imu_refine_angle_deg),
+                    "height_rank": float(imu_floor_position_stats.get("height_rank", np.nan)),
+                    "selection_source": f"{imu_floor_stats['method']}_refined",
+                })
+                final_camera_height_stats = imu_height_stats
+                final_floor_position_stats = imu_floor_position_stats
+
+                final_height_valid = bool(imu_height_valid)
+                final_height_reason = str(imu_height_reason)
+                decision_reason = (
+                    "imu_low_plane_refined_accepted: "
+                    f"method={imu_floor_stats['method']}; "
+                    f"candidate={len(imu_attempts)}/{imu_floor_search['num_candidates']}; "
+                    f"refine_angle_from_imu={imu_refine_angle_deg:.6f} deg"
+                )
+                print(
+                    f"[IMU] accepted on candidate {len(imu_attempts)}: floor found below "
+                    "the minimum camera height along the IMU axis, final up re-estimated "
+                    "from the point cloud.",
+                    flush=True,
+                )
+            else:
+                print(f"[IMU] rejected: {imu_reject_reason}", flush=True)
+                up = normalize(imu_up)
+                floor_center = imu_floor_center
+                floor_mask = imu_floor_mask
+                selected = dict(imu_selected)
+                selected.update({
+                    "normal": np.asarray(imu_up, dtype=np.float64),
+                    "center": np.asarray(imu_floor_center, dtype=np.float64),
+                    "up": np.asarray(imu_up, dtype=np.float64),
+                    "inliers": int(imu_floor_refine_stats["inliers"]),
+                    "ratio": float(imu_floor_refine_stats["inlier_ratio"]),
+                    "rms": float(imu_floor_refine_stats["rms"]),
+                    "area": float(imu_floor_refine_stats["area"]),
+                    "angle_to_prior_deg": float(imu_refine_angle_deg),
+                    "height_rank": float(imu_floor_position_stats.get("height_rank", np.nan)),
+                    "selection_source": f"{imu_floor_stats['method']}_failed_diagnostic",
+                })
+                final_camera_height_stats = imu_height_stats
+                final_floor_position_stats = imu_floor_position_stats
+                final_height_valid = bool(imu_height_valid)
+                final_height_reason = str(imu_height_reason)
+                decision_reason = f"imu_low_plane_refine_angle_failed_no_egogvae: {imu_reject_reason}"
+                print(
+                    "[IMU] Alignment failed; writing diagnostic alignment files and "
+                    "leaving accepted=false so the main pipeline skips EgoGVAE.",
+                    flush=True,
+                )
+
+    # Stage 2B: optional GeoCalib appearance-based gravity prior.
+    elif args.geocalib_gravity is not None:
         try:
             up_geocalib, geocalib_stats = estimate_up_from_geocalib(
                 args.geocalib_gravity,
@@ -1395,6 +2524,8 @@ def main():
                             cam_centers,
                             params,
                             up_geocalib,
+                            hand_frames=hand_frames,
+                            head_timestamps=head_timestamps,
                         )
 
                         if selected_low is not None:
@@ -1407,6 +2538,8 @@ def main():
                                 params,
                                 up_prior=up_geocalib,
                                 strong_prior=True,
+                                hand_frames=hand_frames,
+                                head_timestamps=head_timestamps,
                             )
                             low_prior_stats["fallback_selected_source"] = "global_prior_rescore"
 
@@ -1437,10 +2570,37 @@ def main():
                             min_camera_above_floor_ratio=args.min_camera_above_floor_ratio,
                             min_camera_p10_height_margin_factor=args.min_camera_p10_height_margin_factor,
                         )
+                        final_floor_position_stats = floor_position_stats(
+                            P,
+                            floor_center,
+                            up,
+                            params,
+                        )
+                        floor_position_valid = bool(
+                            final_floor_position_stats.get("low_position_valid", False)
+                        ) and not bool(final_floor_position_stats.get("tabletop_risk", False))
+                        if floor_position_valid:
+                            floor_position_reason = "floor_position_valid"
+                        else:
+                            floor_position_reason = (
+                                "geocalib_prior_floor_position_invalid: "
+                                f"height_rank={final_floor_position_stats.get('height_rank', float('nan')):.6g} "
+                                f"below_margin_ratio={final_floor_position_stats.get('below_margin_ratio', float('nan')):.6g} "
+                                f"max_below_margin_ratio={final_floor_position_stats.get('max_below_margin_ratio', MAX_BELOW_FLOOR_RATIO):.6g} "
+                                f"low_position_valid={final_floor_position_stats.get('low_position_valid', False)} "
+                                f"tabletop_risk={final_floor_position_stats.get('tabletop_risk', False)}"
+                            )
+                        fallback_reason_candidate = None
+                        if not final_height_valid:
+                            fallback_reason_candidate = (
+                                f"geocalib_prior_height_validation_failed: {final_height_reason}"
+                            )
+                        elif not floor_position_valid:
+                            fallback_reason_candidate = floor_position_reason
 
-                        if args.fallback_to_ransac_on_invalid_height and not final_height_valid:
+                        if args.fallback_to_ransac_on_invalid_height and fallback_reason_candidate is not None:
                             fallback_to_ransac = True
-                            fallback_reason = f"geocalib_prior_height_validation_failed: {final_height_reason}"
+                            fallback_reason = fallback_reason_candidate
                             print(f"[Warning] {fallback_reason}")
                             print("[Warning] Falling back to point-cloud-only RANSAC alignment.")
 
@@ -1458,16 +2618,11 @@ def main():
                             decision_reason = fallback_reason
                         else:
                             used_geocalib_prior = True
-                            final_floor_position_stats = floor_position_stats(
-                                P,
-                                floor_center,
-                                up,
-                                params,
-                            )
                             decision_reason = (
                                 "geocalib_disagrees_with_ransac_prior_refined_and_accepted: "
                                 f"angle={geocalib_angle_deg:.6f} > {args.geocalib_switch_angle_deg:.6f}; "
-                                f"height_valid={final_height_valid}; reason={final_height_reason}"
+                                f"height_valid={final_height_valid}; floor_position_valid={floor_position_valid}; "
+                                f"reason={final_height_reason if not final_height_valid else floor_position_reason}"
                             )
             else:
                 # Direction agreement is not enough: still check whether the
@@ -1478,6 +2633,8 @@ def main():
                     cam_centers,
                     params,
                     up_geocalib,
+                    hand_frames=hand_frames,
+                    head_timestamps=head_timestamps,
                 )
                 low_prior_stats["direction_consistent"] = True
                 low_prior_stats["ransac_floor_position_stats"] = ransac_floor_position_stats
@@ -1560,6 +2717,25 @@ def main():
                         f"ransac_floor_position={ransac_floor_position_stats}"
                     )
 
+    final_hand_height_stats = {}
+    final_hand_height_valid = True
+    final_hand_height_reason = "not_checked_in_real_imu_mode" if imu_mode else "valid"
+    if not imu_mode:
+        final_hand_height_stats = hand_above_head_stats(
+            hand_frames,
+            cam_centers,
+            head_timestamps,
+            floor_center,
+            up,
+        )
+        final_hand_height_valid, final_hand_height_reason = validate_head_above_hands(
+            final_hand_height_stats
+        )
+        if not final_height_valid:
+            raise RuntimeError(f"No-IMU final head height check failed: {final_height_reason}")
+        if not final_hand_height_valid:
+            raise RuntimeError(f"No-IMU final head/hand height check failed: {final_hand_height_reason}")
+
     target_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     R_align = rotation_from_vectors(up, target_up)
     np.save(args.out, R_align.astype(np.float64))
@@ -1574,7 +2750,11 @@ def main():
         R_align=R_align.astype(np.float64),
         floor_center_da3=np.asarray(floor_center, dtype=np.float64),
         up_final_da3=np.asarray(up, dtype=np.float64),
-        up_ransac_da3=np.asarray(up_ransac, dtype=np.float64),
+        up_ransac_da3=(
+            np.asarray(up_ransac, dtype=np.float64)
+            if up_ransac is not None
+            else np.full(3, np.nan, dtype=np.float64)
+        ),
         up_geocalib_da3=(
             np.asarray(up_geocalib, dtype=np.float64)
             if up_geocalib is not None
@@ -1602,12 +2782,26 @@ def main():
             else np.array(False, dtype=bool)
         ),
         used_geocalib_prior=np.array(used_geocalib_prior, dtype=bool),
+        imu_mode=np.array(imu_mode, dtype=bool),
+        used_imu_gravity=np.array(used_imu_gravity, dtype=bool),
+        up_imu_da3=(
+            np.asarray(up_imu, dtype=np.float64)
+            if up_imu is not None
+            else np.full(3, np.nan, dtype=np.float64)
+        ),
+        up_imu_raw_da3=(
+            np.asarray(up_imu_raw, dtype=np.float64)
+            if up_imu_raw is not None
+            else np.full(3, np.nan, dtype=np.float64)
+        ),
+        imu_stats_json=np.array(json.dumps(imu_stats), dtype=object),
         fallback_to_ransac=np.array(fallback_to_ransac, dtype=bool),
         fallback_reason=np.array(str(fallback_reason or ""), dtype=object),
         decision_reason=np.array(str(decision_reason), dtype=object),
         ransac_camera_height_stats_json=np.array(json.dumps(ransac_camera_height_stats), dtype=object),
         geocalib_precheck_height_stats_json=np.array(json.dumps(geocalib_precheck_height_stats), dtype=object),
         final_camera_height_stats_json=np.array(json.dumps(final_camera_height_stats), dtype=object),
+        final_hand_height_stats_json=np.array(json.dumps(final_hand_height_stats), dtype=object),
         ransac_floor_position_stats_json=np.array(json.dumps(ransac_floor_position_stats), dtype=object),
         final_floor_position_stats_json=np.array(json.dumps(final_floor_position_stats), dtype=object),
         height_validation_json=np.array(json.dumps({
@@ -1623,6 +2817,8 @@ def main():
             "geocalib_direction_consistent": geocalib_direction_consistent,
             "final_height_valid": bool(final_height_valid),
             "final_height_reason": str(final_height_reason),
+            "final_hand_height_valid": bool(final_hand_height_valid),
+            "final_hand_height_reason": str(final_hand_height_reason),
             "min_valid_camera_height_margin_factor": float(args.min_valid_camera_height_margin_factor),
             "min_camera_above_floor_ratio": float(args.min_camera_above_floor_ratio),
             "min_camera_p10_height_margin_factor": float(args.min_camera_p10_height_margin_factor),
@@ -1668,6 +2864,55 @@ def main():
         ),
     )
 
+    if imu_mode:
+        floor_search = {
+            k: v for k, v in imu_stats.get("floor_search", {}).items() if k != "bands"
+        }
+        print("[IMU] Saved rotation:", args.out)
+        print("[IMU] Saved metadata:", args.out_meta)
+        if used_imu_gravity:
+            alignment_source = "imu_guided_low_floor_refined"
+        else:
+            alignment_source = "imu_failed_no_ransac_fallback"
+        print("[IMU] Alignment source:", alignment_source)
+        print("[IMU] Final up in DA3 world:", up)
+        print("[IMU] Measured IMU vertical after hand-height sign check:", up_imu)
+        print("[IMU] Raw IMU vertical from file:", up_imu_raw)
+        print("[IMU] Point-cloud RANSAC baseline:", "not run in real-IMU mode")
+        print("[IMU] Decision:", decision_reason)
+        if fallback_reason:
+            print("[IMU] Fallback reason:", fallback_reason)
+        print("[IMU] Low plane search along IMU axis:", floor_search)
+        print("[IMU] Candidates tried:", imu_stats.get("attempts", []))
+        print("[IMU] Chosen low plane:", imu_stats.get("floor_fit", {}))
+        print("[IMU] Refined floor from point cloud:", imu_stats.get("floor_refine", {}))
+        print("[IMU] Head height stats:", final_camera_height_stats)
+        print("[IMU] Head height valid:", final_height_valid, "reason:", final_height_reason)
+        print("[IMU] Floor position stats:", final_floor_position_stats)
+        print("[IMU] RANSAC head height stats:", "not run in real-IMU mode")
+        print("[IMU] Selected floor source:", selected.get("selection_source", "global_ransac"))
+        print("[IMU] Selected floor inliers:", selected["inliers"], "area:", selected["area"])
+        print("[IMU] Check R_align @ up:", R_align @ up)
+        print("[IMU] Angle to +Y after alignment:", angle_error, "deg")
+        print(
+            "[IMU] Auto params:",
+            {
+                "voxel_size": params["voxel_size"],
+                "distance_threshold": params["distance_threshold"],
+                "height_margin": params["height_margin"],
+                "scene_extent": params["scene_extent"],
+            },
+        )
+        print(
+            "[IMU] Validation:",
+            {
+                "floor_points": validation["floor_points"],
+                "floor_y_std": validation["floor_y_std"],
+                "floor_y_range_p95_p5": validation["floor_y_range_p95_p5"],
+            },
+        )
+        return
+
     print("Saved:", args.out)
     print("Saved metadata:", args.out_meta)
     print("Estimated up in DA3 world:", up)
@@ -1685,6 +2930,8 @@ def main():
     print("GeoCalib precheck height stats:", geocalib_precheck_height_stats)
     print("GeoCalib flip precheck height stats:", geocalib_flip_precheck_height_stats)
     print("Final camera height stats:", final_camera_height_stats)
+    print("Final head/hand height stats:", final_hand_height_stats)
+    print("Final head/hand height valid:", final_hand_height_valid, "reason:", final_hand_height_reason)
     print("RANSAC floor position stats:", ransac_floor_position_stats)
     print("Final floor position stats:", final_floor_position_stats)
     print("Final height valid:", final_height_valid, "reason:", final_height_reason)

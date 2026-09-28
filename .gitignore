@@ -4,6 +4,7 @@ data/outputs/egoallo_outputs/*
 data/outputs/tmp/*
 data/outputs/thk/*
 jax_cache/*
+tests/outputs/*
 
 # 第三方库源码
 third_party/*
@@ -17,9 +18,17 @@ third_party/*
 !data/outputs/thk/.gitkeep
 !third_party/.gitkeep
 # ========================= IDE =========================
-.idea/ .vscode/ *.swp *.swo
+.idea/
+.vscode/
+*.swp
+*.swo
 # ========================= Python =========================
-__pycache__/ *.pyc *.pyo *.pyd .pytest_cache/ .mypy_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
 # ========================= OS =========================
 .DS_Store
 Thumbs.db

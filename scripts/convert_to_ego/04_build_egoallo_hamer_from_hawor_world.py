@@ -8,6 +8,7 @@ import json
 import pickle
 import re
 import warnings
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -166,16 +167,22 @@ def records_have_explicit_soft_alpha(records):
     return False
 
 
-def add_soft_weight_fields(det, soft_alpha, hand):
-    """Attach optional soft-start metadata to one EgoAllo hand detection dict."""
+def add_soft_weight_fields(det, soft_alpha, hand, constraint_mode="full"):
+    """Attach normalized per-residual weights to one EgoAllo hand detection dict."""
     weight = np.asarray([float(np.clip(soft_alpha, 0.0, 1.0))], dtype=np.float32)
+    is_wrist_only = str(constraint_mode) == "wrist_only"
     det["constraint_weight"] = weight.copy()
+    det["hand_pose_weight"] = np.zeros_like(weight) if is_wrist_only else weight.copy()
+    det["hand_reproj_weight"] = np.zeros_like(weight) if is_wrist_only else weight.copy()
+    det["wrist_pose_weight"] = weight.copy()
     det["visualization_alpha"] = weight.copy()
     det["visualization_weight"] = weight.copy()
     det["render_alpha"] = weight.copy()
     det["soft_alpha"] = weight.copy()
     det["confidence"] = weight.copy()
     det["score"] = weight.copy()
+    det["constraint_mode"] = np.asarray([str(constraint_mode)], dtype=object)
+    det["wrist_only"] = np.asarray([is_wrist_only], dtype=np.bool_)
 
     raw_conf = finite_scalar(hand.get("raw_confidence", None), default=None)
     if raw_conf is not None:
@@ -267,14 +274,14 @@ def estimate_R_cam_wrist(keypoints, side):
     middle_mcp = kp[9]
     pinky_mcp = kp[17]
 
-    y_axis = normalize(middle_mcp - wrist)
-    x_axis = normalize(index_mcp - pinky_mcp)
-    if side == "left":
+    x_axis = normalize(middle_mcp - wrist)
+    z_raw = normalize(index_mcp - pinky_mcp)
+    if side == "right":
         x_axis = -x_axis
-    z_axis = normalize(np.cross(x_axis, y_axis))
-    if np.linalg.norm(z_axis) < 1e-6:
+    y_axis = normalize(-np.cross(x_axis, z_raw))
+    if np.linalg.norm(y_axis) < 1e-6:
         return np.eye(3, dtype=np.float32)
-    x_axis = normalize(np.cross(y_axis, z_axis))
+    z_axis = normalize(np.cross(x_axis, y_axis))
     return np.stack([x_axis, y_axis, z_axis], axis=1).astype(np.float32)
 
 
@@ -338,11 +345,51 @@ def infer_frame_ids_from_file(path, count):
 
 
 def add_mano_record(mapping, side, frame_id, root_orient, hand_pose, betas):
-    mapping[(side, int(frame_id))] = {
+    mapping.setdefault((side, int(frame_id)), []).append({
         "mano_hand_global_orient": normalize_orient_array(root_orient),
         "mano_hand_pose": normalize_pose_array(hand_pose),
         "mano_hand_betas": normalize_betas(betas),
-    }
+    })
+
+
+@lru_cache(maxsize=2)
+def load_mano_layer(path, side):
+    from smplx import MANOLayer
+    return MANOLayer(str(path), is_rhand=side == "right", flat_hand_mean=True).eval()
+
+
+def select_mano_record(mapping, side, frame_id, keypoints_cam=None, mano_path=None):
+    candidates = mapping.get((side, int(frame_id)), [])
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    if keypoints_cam is None or mano_path is None:
+        return None
+
+    # Overlapping chunks can contain different hands at the same frame. Match
+    # wrist-relative geometry in the HaWoR camera frame, without using depth.
+    target = np.asarray(keypoints_cam, dtype=np.float32)
+    if target.shape != (21, 3) or not np.isfinite(target).all():
+        return None
+    target = target[[0, 5, 6, 7, 9, 10, 11, 17, 18, 19, 13, 14, 15, 1, 2, 3]]
+    target = target - target[:1]
+    norm = np.linalg.norm(target)
+    if norm < 1e-6:
+        return None
+    import torch
+    layer = load_mano_layer(str(mano_path), side)
+    tensor = lambda key: torch.from_numpy(np.stack([c[key] for c in candidates]))
+    with torch.no_grad():
+        predicted = layer(betas=tensor("mano_hand_betas"),
+                          global_orient=tensor("mano_hand_global_orient")[:, None],
+                          hand_pose=tensor("mano_hand_pose")).joints.numpy()
+    predicted = predicted - predicted[:, :1]
+    scale = (predicted * target).sum((1, 2)) / np.maximum((predicted ** 2).sum((1, 2)), 1e-12)
+    errors = np.linalg.norm((predicted * scale[:, None, None] - target).reshape(len(candidates), -1), axis=1) / norm
+    errors[(scale <= 0) | ~np.isfinite(errors)] = np.inf
+    best, runner_up = np.argsort(errors)[:2]
+    if errors[best] > 0.15 or errors[runner_up] < max(errors[best] * 1.5, errors[best] + 0.03):
+        return None
+    return candidates[best]
 
 
 def load_cam_space_json(path, side, frame_key):
@@ -519,18 +566,17 @@ def main():
     parser.add_argument(
         "--min-soft-alpha-to-keep",
         type=float,
-        default=-1.0,
+        default=0.0,
         help=(
             "Skip a hand detection when its soft alpha is below this value. "
-            "Use a negative value for auto mode: if --write-soft-weights is enabled, "
-            "keep all detections and write weights for true soft-start; otherwise, if "
-            "the input JSONL contains explicit soft-start fields, use --auto-soft-alpha-threshold."
+            "Default 0 keeps detections and lets EgoAllo consume soft alpha through constraint_weight. "
+            "Use a positive value only for explicit hard filtering."
         ),
     )
     parser.add_argument(
         "--auto-soft-alpha-threshold",
         type=float,
-        default=0.25,
+        default=0.0,
         help=(
             "Threshold used only when --min-soft-alpha-to-keep is negative and the "
             "prepared JSONL contains explicit soft-start fields. Default 0.25 skips "
@@ -557,9 +603,8 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Write constraint_weight / visualization_alpha / confidence / score "
-            "into each detection dict. Enabled by default because the patched EgoAllo downstream "
-            "uses these as soft constraints. Use --no-write-soft-weights for legacy behavior."
+            "Deprecated compatibility flag. Normalized constraint weights are now always written "
+            "because EgoAllo consumes hand_pose_weight/hand_reproj_weight/wrist_pose_weight."
         ),
     )
     parser.add_argument(
@@ -586,11 +631,10 @@ def main():
     parser.add_argument(
         "--skip-missing-mano",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Skip hand detections without per-frame MANO params instead of creating a placeholder MANO hand. "
-            "Enabled by default for stable EgoAllo input. Use --no-skip-missing-mano only if you explicitly "
-            "want placeholder fallback or strict debugging with --require-mano."
+            "Skip hand detections without per-frame MANO params. Disabled by default: if wrist/keypoints are valid, "
+            "missing MANO detections are downgraded to wrist-only constraints."
         ),
     )
     parser.add_argument("--require-mano", action="store_true")
@@ -627,12 +671,15 @@ def main():
         default="frame_id",
         help="Which record id indexes rows in camera_poses.txt.",
     )
+    # Inverse of T_CAMERA_CPF in 05_run_egogvae_from_head.py: camera x/y
+    # are opposite to SMPL-H CPF x/y. Hand arrays remain in camera coordinates.
     parser.add_argument(
         "--T-cpf-cam",
         nargs=7,
         type=float,
         default=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         metavar=("qw", "qx", "qy", "qz", "tx", "ty", "tz"),
+        help="Camera-to-CPF transform (wxyz, xyz); defaults to the EgoGVAE camera convention.",
     )
     args = parser.parse_args()
 
@@ -643,14 +690,13 @@ def main():
             f"hard-skipping detections with soft alpha < {args.min_soft_alpha_to_keep:.3f}."
         )
 
-    if args.write_soft_weights:
-        print("Soft weights will be written into EgoAllo hand detections.")
-    else:
-        print("Soft weights are disabled; output matches legacy hard-constraint behavior.")
+    if not args.write_soft_weights:
+        print("[Warning] --no-write-soft-weights is deprecated; normalized constraint weights are still written.")
+    print("Normalized soft weights will be written into EgoAllo hand detections.")
     if args.skip_missing_mano:
-        print("Missing per-frame MANO detections will be skipped; placeholder MANO is disabled.")
+        print("Missing per-frame MANO detections will be skipped.")
     else:
-        print("Missing per-frame MANO detections may use placeholder MANO unless --require-mano raises first.")
+        print("Missing per-frame MANO detections will become wrist-only constraints when wrist/keypoints are valid.")
     print(
         f"MANO records will be loaded with mano_frame_key={args.mano_frame_key!r} "
         f"and looked up by mano_lookup_field={args.mano_lookup_field!r}."
@@ -729,6 +775,8 @@ def main():
     num_missing_mano = 0
     num_skipped_missing_mano = 0
     num_placeholder_mano = 0
+    num_wrist_only = 0
+    num_full_mano = 0
     num_skipped_low_alpha = 0
     soft_alpha_values = []
     keypoint_consistency_errors = []
@@ -770,24 +818,29 @@ def main():
                     )
                 continue
 
-            keypoints_cam = require_points(hand, "camera_keypoints_3d", context).astype(np.float32)
+            keypoints_cam_input = require_points(hand, "camera_keypoints_3d", context)
+            keypoints_world = require_points(hand, "world_keypoints_3d", context)
             verts_world = require_points(hand, "world_mesh_vertices_3d", context)
 
+            # World points are the canonical smoothed geometry. Reproject them
+            # together so keypoints and mesh cannot drift into different frames.
+            keypoints_cam = world_points_to_camera(
+                keypoints_world,
+                T_world_cam,
+            ).astype(np.float32)
             verts_cam = world_points_to_camera(verts_world, T_world_cam).astype(np.float32)
 
-            keypoints_world = optional_points(hand, "world_keypoints_3d")
-            keypoints_cam_from_world = None
-            if keypoints_world is not None:
-                keypoints_cam_from_world = world_points_to_camera(
-                    keypoints_world,
-                    T_world_cam,
-                ).astype(np.float32)
-                err = np.linalg.norm(keypoints_cam_from_world - keypoints_cam, axis=1)
-                keypoint_consistency_errors.extend(err.tolist())
+            err = np.linalg.norm(keypoints_cam - keypoints_cam_input, axis=1)
+            keypoint_consistency_errors.extend(err.tolist())
 
             mano_lookup_id = frame_id if args.mano_lookup_field == "frame_id" else src_frame_id
-            mano = mano_map.get((side, mano_lookup_id))
+            mano = select_mano_record(
+                mano_map, side, mano_lookup_id,
+                keypoints_cam=hand.get("hawor_camera_keypoints_3d"),
+                mano_path=args.mano_left_pkl if side == "left" else args.mano_right_pkl,
+            )
             has_mano = mano is not None
+            constraint_mode = "full"
             if mano is None:
                 num_missing_mano += 1
                 if args.skip_missing_mano:
@@ -813,12 +866,25 @@ def main():
                     raise KeyError(
                         f"Missing MANO params for side={side}, {args.mano_lookup_field}={mano_lookup_id}. "
                         "Use --mano-lookup-field to choose frame_id/src_frame_id, pass matching cam-space MANO dirs, "
-                        "or use --skip-missing-mano for a conservative EgoAllo input."
+                        "or disable --require-mano to downgrade valid wrist detections to wrist-only constraints."
                     )
-                mano = make_placeholder_mano(keypoints_cam, side)
+                placeholder_keypoints = optional_points(
+                    hand,
+                    "hawor_camera_keypoints_3d",
+                )
+                if placeholder_keypoints is not None:
+                    placeholder_keypoints = (
+                        R_vggtcam_haworcam @ placeholder_keypoints.T
+                    ).T.astype(np.float32)
+                else:
+                    placeholder_keypoints = keypoints_cam
+                mano = make_placeholder_mano(placeholder_keypoints, side)
                 num_placeholder_mano += 1
+                num_wrist_only += 1
+                constraint_mode = "wrist_only"
                 mano_global_orient = mano["mano_hand_global_orient"]
             else:
+                num_full_mano += 1
                 mano_global_orient = (
                     R_vggtcam_haworcam @ mano["mano_hand_global_orient"]
                 ).astype(np.float32)
@@ -830,8 +896,7 @@ def main():
                 "mano_hand_betas": mano["mano_hand_betas"][None].astype(np.float32),
                 "mano_hand_global_orient": mano_global_orient[None].astype(np.float32),
             }
-            if args.write_soft_weights:
-                det = add_soft_weight_fields(det, soft_alpha, hand)
+            det = add_soft_weight_fields(det, soft_alpha, hand, constraint_mode=constraint_mode)
 
             if side == "left":
                 detections_left[timestamp_ns] = det
@@ -851,11 +916,11 @@ def main():
                         "constraint_weight": hand.get("constraint_weight"),
                         "visualization_alpha": hand.get("visualization_alpha"),
                         "camera_keypoints_3d": keypoints_cam.tolist(),
-                        "camera_keypoints_from_world_3d": (
-                            None if keypoints_cam_from_world is None else keypoints_cam_from_world.tolist()
-                        ),
+                        "camera_keypoints_input_3d": keypoints_cam_input.tolist(),
+                        "camera_keypoints_from_world_3d": keypoints_cam.tolist(),
                         "camera_mesh_vertices_3d": verts_cam.tolist(),
                         "has_mano": has_mano,
+                        "constraint_mode": constraint_mode,
                     }
                 )
 
@@ -886,9 +951,9 @@ def main():
         )
         if errors.max() > 1e-3:
             print(
-                "[Warning] camera_keypoints_3d and world_keypoints_3d transformed by "
-                "camera_poses.txt are not identical. If this is large, check pose indexing "
-                "or whether camera_poses.txt is in the same VGGT-world coordinate system."
+                "[Warning] Input camera_keypoints_3d and world_keypoints_3d transformed by "
+                "camera_poses.txt are not identical. The output uses the world-derived "
+                "camera keypoints so its keypoints and mesh stay spatially consistent."
             )
 
     outputs = {
@@ -918,14 +983,16 @@ def main():
             f"p90={np.percentile(alpha_arr, 90):.3f}, "
             f"max={alpha_arr.max():.3f}"
         )
-    print(f"MANO records loaded: {len(mano_map)}")
+    print(f"MANO records loaded: {sum(len(candidates) for candidates in mano_map.values())}")
+    print(f"Full MANO constraints: {num_full_mano}")
+    print(f"Wrist-only constraints: {num_wrist_only}")
     print(f"Hands missing MANO: {num_missing_mano}")
     print(f"Hands skipped by missing MANO: {num_skipped_missing_mano}")
     print(f"Hands using placeholder MANO: {num_placeholder_mano}")
     if num_placeholder_mano:
         print(
-            "[Warning] Missing MANO params were filled with placeholders. "
-            "For no-Aria-wrist runs, prefer --skip-missing-mano or --require-mano with correct --mano-lookup-field."
+            "[Warning] Missing MANO params were filled with placeholder MANO arrays, "
+            "but their hand_pose_weight and hand_reproj_weight are zero; only wrist_pose_weight is active."
         )
     if args.debug_camera_jsonl is not None:
         print(f"Saved debug camera-frame hands: {args.debug_camera_jsonl}")

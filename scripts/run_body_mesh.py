@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -10,9 +11,11 @@ import subprocess
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import yaml
 
 sys.dont_write_bytecode = True
@@ -29,28 +32,39 @@ SCRIPT_02_EXTRACT_HANDS = CONVERT_TO_EGO_DIR / "02_extract_hawor_world_hands.py"
 SCRIPT_03_STABILIZE_HANDS = CONVERT_TO_EGO_DIR / "03_stabilize_hawor_hands_for_egoallo.py"
 SCRIPT_EXTRACT_ROT = CONVERT_TO_EGO_DIR / "extract_hawor_to_vggt_rotation.py"
 SCRIPT_04_BUILD_HAMER = CONVERT_TO_EGO_DIR / "04_build_egoallo_hamer_from_hawor_world.py"
-SCRIPT_ESTIMATE_MOGE_SCALE = CONVERT_TO_EGO_DIR / "04_estimate_moge_metric_scale.py"
+SCRIPT_PREPARE_REAL_SENSOR = CONVERT_TO_EGO_DIR / "04_prepare_real_sensor_inputs.py"
+SCRIPT_ESTIMATE_FOUNDATIONGEO_SCALE = CONVERT_TO_EGO_DIR / "04_estimate_foundationgeo_metric_scale.py"
 SCRIPT_05_APPLY_SCALE = CONVERT_TO_EGO_DIR / "05_apply_metric_scale.py"
-SCRIPT_05B_RESAMPLE = CONVERT_TO_EGO_DIR / "05b_resample_egoallo_inputs.py"
 
 SCRIPT_RUN_GEOCALIB = ESMATEG_DIR / "run_geocalib.py"
 SCRIPT_ESTIMATE_GRAVITY = ESMATEG_DIR / "01_estimate_gravity_da3_geocalib.py"
 SCRIPT_APPLY_ALIGNMENT = ESMATEG_DIR / "02_apply_alignment_da3_geocalib.py"
 
-SCRIPT_VALIDATE_POSE_BEFORE_EGOALLO = SCRIPTS_DIR / "05c_validate_pose_before_egoallo.py"
-SCRIPT_RUN_EGOALLO = SCRIPTS_DIR / "05_run_egoallo.sh"
-SCRIPT_SMOOTH_EGOALLO = SCRIPTS_DIR / "06_smooth_egoallo_segments.py"
+SCRIPT_VALIDATE_POSE_BEFORE_EGOGVAE = SCRIPTS_DIR / "05c_validate_pose_before_egogvae.py"
+SCRIPT_RUN_EGOGVAE = SCRIPTS_DIR / "05_run_egogvae_from_head.py"
+SCRIPT_RUN_EGOALLO_REFINE = SCRIPTS_DIR / "07_run_egoallo_refine_with_prior.py"
+FINAL_MOTION_NAME = "merged_smoothed_vis.npz"
+
+
+@dataclass(frozen=True)
+class UpstreamInputs:
+    episode_dir: Path
+    downstream_dir: Path
+    frames_dir: Path
+    cam_space_dir: Path
+    objects_parquet: Path
+    object_meshes: tuple[Path, ...]
+    hawor_hands_vggt_world: Path
+    hawor_to_vggt_alignment: Path
+    vggt_head_pose: Path
+    scene_points_ply: Path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run BodyMesh/EgoAllo pipeline from keypoint_tool cache.")
+    parser = argparse.ArgumentParser(description="Run BodyMesh/EgoGVAE pipeline from episode/downstream inputs.")
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--frames-dir", type=Path, required=True)
-    parser.add_argument("--cam-space-dir", type=Path, required=True)
-    parser.add_argument("--hawor-hands-vggt-world", type=Path, required=True)
-    parser.add_argument("--hawor-to-vggt-alignment", type=Path, required=True)
-    parser.add_argument("--vggt-head-pose", type=Path, required=True)
-    parser.add_argument("--scene-points-ply", type=Path, required=True)
+    parser.add_argument("--episode-dir", type=Path, required=True)
+    parser.add_argument("--downstream-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -72,6 +86,14 @@ def get_cfg(cfg: dict[str, Any], dotted_key: str, default: Any = None) -> Any:
     return cur
 
 
+def finite_positive_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) and out > 0.0 else None
+
+
 def resolve_project_path(value: str | Path | None) -> Path | None:
     if value in (None, ""):
         return None
@@ -87,6 +109,415 @@ def require_file(path: Path, name: str) -> None:
 def require_dir(path: Path, name: str) -> None:
     if not path.is_dir():
         raise FileNotFoundError(f"Required directory '{name}' not found: {path}")
+
+
+def _prepare_upstream_inputs(
+    *,
+    episode_dir: Path,
+    downstream_dir: Path,
+    prepared_dir: Path,
+    frame_count: int | None = None,
+) -> UpstreamInputs:
+    manifest = _read_downstream_manifest(downstream_dir)
+
+    frames_dir = prepared_dir / "frames"
+    cam_space_dir = downstream_dir / "poses" / "cam_space"
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    camera_parquet = (downstream_dir / "poses" / "camera_30fps.parquet").resolve()
+    hands_parquet = (downstream_dir / "poses" / "hands_30fps.parquet").resolve()
+    objects_parquet = (downstream_dir / "poses" / "objects_30fps.parquet").resolve()
+    alignment_json = _downstream_dataset_path(downstream_dir, manifest, "alignment")
+    scene_points_ply = _downstream_dataset_path(downstream_dir, manifest, "static_pointcloud")
+
+    vggt_head_pose = prepared_dir / "vggt_head_pose.jsonl"
+    hawor_hands_vggt_world = prepared_dir / "hawor_hands_vggt_world.jsonl"
+
+    object_meshes: list[Path] = []
+    for entry in manifest.get("object_meshes", []):
+        mesh_path = str(entry.get("mesh") or "").strip()
+        if not mesh_path:
+            continue
+        path = Path(mesh_path).expanduser()
+        path = path.resolve() if path.is_absolute() else (downstream_dir / path).resolve()
+        object_meshes.append(path)
+
+    _extract_rgb_frames(
+        episode_dir=episode_dir,
+        camera_parquet=camera_parquet,
+        frames_dir=frames_dir,
+        frame_count=frame_count,
+    )
+    _write_camera_jsonl(camera_parquet, vggt_head_pose)
+    _write_hands_jsonl(hands_parquet, hawor_hands_vggt_world)
+
+    require_file(alignment_json, "downstream alignment.json")
+    require_file(scene_points_ply, "downstream static_pointcloud")
+
+    return UpstreamInputs(
+        episode_dir=episode_dir,
+        downstream_dir=downstream_dir,
+        frames_dir=frames_dir,
+        cam_space_dir=cam_space_dir,
+        objects_parquet=objects_parquet,
+        object_meshes=tuple(object_meshes),
+        hawor_hands_vggt_world=hawor_hands_vggt_world,
+        hawor_to_vggt_alignment=alignment_json,
+        vggt_head_pose=vggt_head_pose,
+        scene_points_ply=scene_points_ply,
+    )
+
+
+def _read_downstream_manifest(downstream_dir: Path) -> dict[str, Any]:
+    manifest_path = downstream_dir / "manifest.json"
+    with manifest_path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    if not isinstance(manifest, dict):
+        raise TypeError(f"downstream manifest must be a JSON object: {manifest_path}")
+    datasets = manifest.get("datasets")
+    if not isinstance(datasets, dict):
+        raise KeyError(f"downstream manifest missing 'datasets': {manifest_path}")
+    return manifest
+
+
+def _downstream_dataset_path(
+    downstream_dir: Path,
+    manifest: dict[str, Any],
+    key: str,
+) -> Path:
+    dataset = manifest.get("datasets", {}).get(key)
+    if not isinstance(dataset, dict):
+        raise KeyError(f"downstream manifest missing dataset '{key}'")
+    raw_path = dataset.get("path")
+    if not raw_path:
+        raise KeyError(f"downstream dataset '{key}' missing path")
+    path = Path(str(raw_path)).expanduser()
+    path = path.resolve() if path.is_absolute() else (downstream_dir / path).resolve()
+    return path
+
+
+def _episode_stream_path(
+    episode_dir: Path,
+    *,
+    modality: str,
+    stream_id: str | None = None,
+) -> Path:
+    episode_path = episode_dir / "episode.json"
+    with episode_path.open("r", encoding="utf-8") as f:
+        episode = json.load(f)
+    for stream in episode.get("streams", []):
+        if not isinstance(stream, dict):
+            continue
+        if stream_id is not None and stream.get("stream_id") != stream_id:
+            continue
+        if modality is not None and stream.get("modality") != modality:
+            continue
+        uri = str(stream.get("uri") or "").strip()
+        if not uri:
+            continue
+        path = Path(uri).expanduser()
+        path = path.resolve() if path.is_absolute() else (episode_dir / path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Episode stream file not found: {path}")
+        return path
+    raise KeyError(
+        f"Episode stream not found: modality={modality!r}, stream_id={stream_id!r}"
+    )
+
+
+def _preferred_rgb_stream_id(episode_dir: Path) -> str:
+    episode_path = episode_dir / "episode.json"
+    with episode_path.open("r", encoding="utf-8") as f:
+        episode = json.load(f)
+
+    first_rgb: str | None = None
+    for stream in episode.get("streams", []):
+        if not isinstance(stream, dict):
+            continue
+        if stream.get("modality") != "rgb":
+            continue
+        uri = str(stream.get("uri") or "").strip()
+        if not uri:
+            continue
+        stream_id = str(stream.get("stream_id") or "").strip()
+        if not stream_id:
+            continue
+        if stream_id == "camera_left":
+            return stream_id
+        if first_rgb is None:
+            first_rgb = stream_id
+
+    if first_rgb is None:
+        raise KeyError("No RGB stream with uri found in episode.json")
+    return first_rgb
+
+
+def _read_parquet(path: Path):
+    try:
+        import pandas as pd
+
+        return pd.read_parquet(path)
+    except Exception as exc:  # pragma: no cover - environment diagnostics
+        raise RuntimeError(f"Reading parquet requires pandas/pyarrow: {path}") from exc
+
+
+def _extract_rgb_frames(
+    *,
+    episode_dir: Path,
+    camera_parquet: Path,
+    frames_dir: Path,
+    frame_count: int | None = None,
+) -> None:
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover - dependency diagnostic
+        raise RuntimeError("OpenCV is required to extract episode RGB frames") from exc
+
+    rgb_stream_id = _preferred_rgb_stream_id(episode_dir)
+    video_path = _episode_stream_path(
+        episode_dir,
+        modality="rgb",
+        stream_id=rgb_stream_id,
+    )
+    table = _read_parquet(camera_parquet)
+    rows = list(table.iterrows())
+    if frame_count is not None and int(frame_count) > 0 and int(frame_count) < len(rows):
+        indices = sorted(
+            set(
+                np.linspace(0, len(rows) - 1, int(frame_count))
+                .round()
+                .astype(int)
+                .tolist()
+            )
+        )
+        rows = [rows[i] for i in indices]
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open episode RGB video: {video_path}")
+    try:
+        for _, row in rows:
+            frame_id = int(row["frame_id"])
+            source_frame_idx = int(row["source_frame_idx"])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame_idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError(
+                    f"Failed to read source frame {source_frame_idx} from {video_path}"
+                )
+            output_path = frames_dir / f"{frame_id:06d}.jpg"
+            if not cv2.imwrite(str(output_path), frame):
+                raise RuntimeError(f"Failed to write extracted frame: {output_path}")
+    finally:
+        cap.release()
+
+    print(
+        f"[Frames] extracted {len(list(frames_dir.glob('*.jpg')))} RGB frames "
+        f"from stream_id={rgb_stream_id}: {video_path}",
+        flush=True,
+    )
+
+
+def _write_camera_jsonl(camera_parquet: Path, output_path: Path) -> None:
+    require_file(camera_parquet, "downstream camera_30fps.parquet")
+    table = _read_parquet(camera_parquet)
+
+    with output_path.open("w", encoding="utf-8") as f:
+        for _, row in table.iterrows():
+            t_world_from_camera = np.asarray(row["T_world_from_camera"], dtype=np.float64).reshape(-1)
+            if t_world_from_camera.size != 16:
+                raise ValueError(
+                    f"T_world_from_camera must contain 16 values, got {t_world_from_camera.size}"
+                )
+            matrix = t_world_from_camera.reshape(4, 4)
+            intrinsics = np.asarray(row["intrinsics"], dtype=np.float64).reshape(-1)
+            if intrinsics.size != 9:
+                raise ValueError(f"intrinsics must contain 9 values, got {intrinsics.size}")
+
+            record = {
+                "extracted_idx": int(row["frame_id"]),
+                "original_frame_idx": int(row["source_frame_idx"]),
+                "timestamp": float(row["timestamp_ns"]) / 1e9,
+                "coordinate": "camera_to_world",
+                "R": matrix[:3, :3].tolist(),
+                "t": matrix[:3, 3].tolist(),
+                "intrinsics": intrinsics.reshape(3, 3).tolist(),
+                "depth_shape": [int(row["depth_height"]), int(row["depth_width"])],
+                "length_unit": str(row.get("length_unit") or "meter"),
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _vector_to_nested(value: Any, width: int, field_name: str) -> list[list[float]]:
+    arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    if arr.size == 0 or arr.size % width != 0:
+        raise ValueError(f"{field_name} must contain a multiple of {width} values")
+    return arr.reshape(-1, width).tolist()
+
+
+def _optional_vector_to_nested(value: Any, width: int) -> list[list[float]] | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float64)
+    except Exception:
+        return None
+    if arr.size == 0:
+        return None
+    return _vector_to_nested(arr, width, "hawor_camera_keypoints")
+
+
+def _write_hands_jsonl(hands_parquet: Path, output_path: Path) -> None:
+    require_file(hands_parquet, "downstream hands_30fps.parquet")
+    table = _read_parquet(hands_parquet)
+
+    by_frame: dict[int, dict[str, Any]] = {}
+    for _, row in table.iterrows():
+        frame_id = int(row["frame_id"])
+        source_frame_idx = int(row["source_frame_idx"])
+        timestamp = float(row["timestamp_ns"]) / 1e9
+        hand = {
+            "side": str(row["side"]),
+            "confidence": float(row["confidence"]),
+            "track_id": str(row.get("track_id") or ""),
+            "keypoints_3d": _vector_to_nested(row["keypoints_world"], 3, "keypoints_world"),
+            "mesh_vertices_3d": _vector_to_nested(row["vertices_world"], 3, "vertices_world"),
+            "camera_keypoints_3d": _vector_to_nested(
+                row["keypoints_camera"], 3, "keypoints_camera"
+            ),
+            "hawor_camera_keypoints_3d": _optional_vector_to_nested(
+                row.get("hawor_camera_keypoints"), 3
+            ),
+        }
+
+        by_frame.setdefault(
+            frame_id,
+            {
+                "extracted_idx": frame_id,
+                "original_frame_idx": source_frame_idx,
+                "timestamp": timestamp,
+                "hands": [],
+            },
+        )["hands"].append(hand)
+
+    with output_path.open("w", encoding="utf-8") as f:
+        for frame_id in sorted(by_frame):
+            f.write(json.dumps(by_frame[frame_id], ensure_ascii=False) + "\n")
+
+
+def resolve_real_sensor_input(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    path = path.expanduser().resolve()
+    if not (path / "episode.json").is_file():
+        print(f"[Real sensor] no episode.json found; use default pipeline: {path}", flush=True)
+        return None
+    imu_path = episode_imu_path(path)
+    has_depth = episode_has_depth_stream(path)
+    has_calibration = episode_calibration_path(path) is not None
+    if imu_path is None and not has_depth and not has_calibration:
+        print(f"[Real sensor] no IMU/depth/calibration found; use default pipeline: {path}", flush=True)
+        return None
+    print(
+        "[Real sensor] episode.json inputs found: "
+        f"imu={'yes' if imu_path else 'no'}, depth={'yes' if has_depth else 'no'}, "
+        f"calibration={'yes' if has_calibration else 'no'}",
+        flush=True,
+    )
+    return path
+
+
+def episode_imu_path(episode_dir: Path) -> Path | None:
+    uri = episode_stream_uri(episode_dir, modality="imu", stream_id="ego_imu")
+    if not uri:
+        return None
+    path = Path(uri).expanduser()
+    path = path.resolve() if path.is_absolute() else (episode_dir / path).resolve()
+    return path if path.is_file() else None
+
+
+def episode_stream_uri(
+    episode_dir: Path,
+    *,
+    modality: str | None = None,
+    stream_id: str | None = None,
+) -> str | None:
+    episode_json = episode_dir / "episode.json"
+    if not episode_json.is_file():
+        return None
+    with episode_json.open("r", encoding="utf-8") as f:
+        episode = json.load(f)
+    for stream in episode.get("streams", []):
+        if not isinstance(stream, dict):
+            continue
+        if stream_id is not None and stream.get("stream_id") != stream_id:
+            continue
+        if modality is not None and stream.get("modality") != modality:
+            continue
+        return str(stream.get("uri") or "").strip() or None
+    return None
+
+
+def episode_stream_id(episode_dir: Path, modality: str) -> str | None:
+    episode_json = episode_dir / "episode.json"
+    if not episode_json.is_file():
+        return None
+    with episode_json.open("r", encoding="utf-8") as f:
+        episode = json.load(f)
+    for stream in episode.get("streams", []):
+        if isinstance(stream, dict) and stream.get("modality") == modality:
+            value = str(stream.get("stream_id") or "").strip()
+            return value or None
+    return None
+
+
+def episode_calibration_path(episode_dir: Path) -> Path | None:
+    episode_json = episode_dir / "episode.json"
+    if not episode_json.is_file():
+        return None
+    with episode_json.open("r", encoding="utf-8") as f:
+        episode = json.load(f)
+    uri = str(episode.get("calibration_uri") or "").strip()
+    if not uri:
+        return None
+    path = Path(uri).expanduser()
+    path = path.resolve() if path.is_absolute() else (episode_dir / path).resolve()
+    return path if path.is_file() else None
+
+
+def episode_has_depth_stream(episode_dir: Path) -> bool:
+    return episode_stream_uri(episode_dir, modality="depth") is not None
+
+
+def read_imu_alignment_decision(align_meta: Path) -> dict[str, Any]:
+    """Summarize the real-IMU alignment outcome for pipeline_run_log.json."""
+    if not align_meta.is_file():
+        return {"status": "missing", "align_meta": str(align_meta)}
+    try:
+        import numpy as np
+
+        with np.load(align_meta, allow_pickle=True) as data:
+            def item(key: str, default: Any = None) -> Any:
+                return data[key].item() if key in data else default
+
+            height_validation = json.loads(str(item("height_validation_json", "{}")))
+            imu_stats = json.loads(str(item("imu_stats_json", "{}")))
+            return {
+                "status": "ok",
+                "align_meta": str(align_meta),
+                "imu_mode": bool(item("imu_mode", False)),
+                "used_imu_gravity": bool(item("used_imu_gravity", False)),
+                "accepted": imu_stats.get("accepted"),
+                "reject_reason": imu_stats.get("reject_reason"),
+                "num_candidates_tried": imu_stats.get("num_candidates_tried"),
+                "decision_reason": str(item("decision_reason", "")),
+                "head_height_valid": height_validation.get("final_height_valid"),
+                "head_height_reason": height_validation.get("final_height_reason"),
+            }
+    except Exception as exc:  # diagnostics only, never fail the pipeline here
+        return {"status": "unreadable", "align_meta": str(align_meta), "error": repr(exc)}
 
 
 def add_flag(cmd: list[str], flag: str, value: Any) -> None:
@@ -108,29 +539,27 @@ def build_subprocess_env(cfg: dict[str, Any]) -> dict[str, str]:
     env["SCRIPTS_DIR"] = str(SCRIPTS_DIR)
     env["PYTHON_EXECUTABLE"] = sys.executable
 
-    # 只把项目脚本路径加入 PYTHONPATH。EgoAllo/GeoCalib 源码路径不在这里提前加入，
-    # 对应子脚本内部会自行决定 import 优先级；这里保留源码/conda 的配置路径并透传给子脚本。
+    # Only project scripts are added here. Model source roots are passed through
+    # env/config so each subprocess owns its import path.
     prepend_pythonpath(env, [PROJECT_ROOT, SCRIPTS_DIR])
 
-    egoallo_root = resolve_project_path(get_cfg(cfg, "model_sources.egoallo_root"))
+    egogvae_root = resolve_project_path(get_cfg(cfg, "model_sources.egogvae_root"))
     geocalib_root = resolve_project_path(get_cfg(cfg, "model_sources.geocalib_root"))
-    moge_root = resolve_project_path(get_cfg(cfg, "model_sources.moge_root"))
-    if egoallo_root is not None:
-        env["EGOALLO_ROOT"] = str(egoallo_root)
+    foundationgeo_root = resolve_project_path(get_cfg(cfg, "model_sources.foundationgeo_root"))
+    if egogvae_root is not None:
+        env["EGOGVAE_ROOT"] = str(egogvae_root)
     if geocalib_root is not None:
         env["GEOCALIB_ROOT"] = str(geocalib_root)
-    if moge_root is not None:
+    if foundationgeo_root is not None:
         # 只作为源码路径传给下游脚本，实际源码/conda优先级由下游脚本自行控制。
-        env["MOGE_ROOT"] = str(moge_root)
+        env["FOUNDATIONGEO_ROOT"] = str(foundationgeo_root)
 
     env_path_map = {
-        "EGOALLO_CHECKPOINT_DIR": "model_weights.egoallo_checkpoint_dir",
-        "EGOALLO_MODEL_CONFIG_PATH": "model_weights.egoallo_model_config_path",
-        "EGOALLO_MODEL_NPZ": "model_weights.egoallo_model_npz",
+        "EGOGVAE_CHECKPOINT_PATH": "model_weights.egogvae_checkpoint_path",
         "GEOCALIB_PINHOLE_TAR": "model_weights.geocalib_pinhole_tar",
         "SMPLH_NPZ_PATH": "model_weights.smplh_npz_path",
         "VPOSER_DIR": "model_weights.vposer_dir",
-        "MOGE_MODEL_PT": "model_weights.moge_model_pt",
+        "FOUNDATIONGEO_MODEL_PT": "model_weights.foundationgeo_model_pt",
     }
     for env_name, cfg_key in env_path_map.items():
         path = resolve_project_path(get_cfg(cfg, cfg_key))
@@ -177,6 +606,227 @@ def write_failed_scale_json(path: Path, *, source: str, reason: str, extra: dict
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def write_empty_egogvae_npz(path: Path, *, num_samples: int, reason: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ns = max(int(num_samples), 1)
+    np.savez(
+        path,
+        Ts_world_cpf=np.empty((0, 7), dtype=np.float32),
+        Ts_world_root=np.empty((ns, 0, 7), dtype=np.float32),
+        body_quats=np.empty((ns, 0, 21, 4), dtype=np.float32),
+        left_hand_quats=np.empty((ns, 0, 15, 4), dtype=np.float32),
+        right_hand_quats=np.empty((ns, 0, 15, 4), dtype=np.float32),
+        betas=np.empty((ns, 0, 16), dtype=np.float32),
+        contacts=np.empty((ns, 0, 21), dtype=np.float32),
+        frame_nums=np.empty((0,), dtype=np.int64),
+        timestamps_ns=np.empty((0,), dtype=np.int64),
+        merge_segment_boundaries=np.empty((0,), dtype=np.int64),
+        merge_segment_lengths=np.empty((0,), dtype=np.int64),
+        merge_is_smoothed=np.asarray(False),
+        merge_boundary_blend_frames=np.asarray(0, dtype=np.int64),
+        merge_translation_smooth_window=np.asarray(0, dtype=np.int64),
+        merge_quat_lowpass_alpha=np.asarray(0.0, dtype=np.float32),
+        egogvae_skipped=np.asarray(True),
+        egogvae_skip_reason=np.asarray(str(reason)),
+    )
+
+
+def _assets_pointclouds_dir(output_dir: Path, cfg: dict[str, Any]) -> Path:
+    return output_dir / str(get_cfg(cfg, "output_layout.assets_pointclouds_dir_name", "assets/pointclouds"))
+
+
+def _assets_poses_dir(output_dir: Path, cfg: dict[str, Any]) -> Path:
+    return output_dir / str(get_cfg(cfg, "output_layout.assets_poses_dir_name", "assets/poses"))
+
+
+def _json_friendly(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_friendly(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_friendly(v) for v in value]
+    if hasattr(value, "tolist"):
+        return _json_friendly(value.tolist())
+    if hasattr(value, "item"):
+        return _json_friendly(value.item())
+    return value
+
+
+def _write_pointcloud_manifest_parquet(path: Path, pointcloud_name: str) -> None:
+    import pandas as pd
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "path": pointcloud_name,
+                "coordinate_system": "egoallo_world",
+                "up_axis": "z",
+                "floor_z": 0.0,
+                "length_unit": "meter",
+            }
+        ]
+    ).to_parquet(path, index=False, engine="pyarrow")
+
+
+def _write_jsonl_parquet(src: Path, dst: Path, *, kind: str) -> None:
+    import pandas as pd
+
+    require_file(src, f"{kind} JSONL")
+    rows: list[dict[str, Any]] = []
+    with src.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            timestamp_ns = int(round(float(rec.get("timestamp", 0.0)) * 1e9))
+            frame_id = int(rec.get("frame_id", 0))
+            common = {
+                "timestamp_ns": timestamp_ns,
+                "frame": frame_id,
+                "timestamp": float(rec.get("timestamp", 0.0)),
+                "src_frame_id": int(rec.get("src_frame_id", frame_id)),
+                "coordinate_system": str(rec.get("coordinate_system", {}).get("name", "egoallo_world")),
+                "length_unit": "meter",
+            }
+            if kind == "head":
+                head = rec.get("head", {})
+                rows.append(
+                    {
+                        **common,
+                        "position": _json_friendly(head.get("position")),
+                        "rotation": _json_friendly(head.get("rotation")),
+                        "matrix": _json_friendly(head.get("matrix")),
+                    }
+                )
+            elif kind == "hands":
+                for hand in rec.get("hands", []):
+                    row = {
+                        **common,
+                        "side": str(hand.get("side", "")),
+                        "confidence": _json_friendly(hand.get("confidence")),
+                        "wrist": _json_friendly(hand.get("wrist")),
+                        "keypoints_3d": _json_friendly(hand.get("keypoints_3d")),
+                    }
+                    if "mesh_vertices_3d" in hand:
+                        row["mesh_vertices_3d"] = _json_friendly(hand.get("mesh_vertices_3d"))
+                    rows.append(row)
+            else:
+                raise ValueError(f"Unsupported JSONL parquet kind: {kind}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        columns = [
+            "timestamp_ns",
+            "frame",
+            "timestamp",
+            "src_frame_id",
+            "coordinate_system",
+            "length_unit",
+        ]
+        if kind == "head":
+            columns.extend(["position", "rotation", "matrix"])
+        elif kind == "hands":
+            columns.extend(["side", "confidence", "wrist", "keypoints_3d", "mesh_vertices_3d"])
+        frame = pd.DataFrame(columns=columns)
+    frame.to_parquet(dst, index=False, engine="pyarrow")
+
+
+def _write_motion_parquet(src: Path, dst: Path) -> None:
+    import numpy as np
+    import pandas as pd
+
+    require_file(src, "final motion NPZ")
+    data = np.load(src, allow_pickle=False)
+    if "frame_nums" not in data or "timestamps_ns" not in data:
+        raise KeyError(f"Motion NPZ must contain frame_nums and timestamps_ns: {src}")
+
+    frame_nums = np.asarray(data["frame_nums"]).reshape(-1)
+    timestamps_ns = np.asarray(data["timestamps_ns"]).reshape(-1)
+    if frame_nums.size != timestamps_ns.size:
+        raise ValueError(f"frame_nums/timestamps_ns length mismatch in {src}")
+
+    rows: list[dict[str, Any]] = []
+    for i in range(frame_nums.size):
+        row: dict[str, Any] = {
+            "timestamp_ns": int(timestamps_ns[i]),
+            "frame": int(frame_nums[i]),
+        }
+        if "timestamps" in data and np.asarray(data["timestamps"]).reshape(-1).size == frame_nums.size:
+            row["timestamp"] = float(np.asarray(data["timestamps"]).reshape(-1)[i])
+
+        for key in sorted(data.files):
+            if key in {"frame_nums", "timestamps_ns", "timestamps"}:
+                continue
+            arr = np.asarray(data[key])
+            if arr.ndim == 0:
+                continue
+            if arr.shape[0] == frame_nums.size:
+                value = arr[i]
+            elif arr.ndim >= 2 and arr.shape[1] == frame_nums.size:
+                value = arr[0, i]
+            else:
+                continue
+            row[key] = _json_friendly(value)
+        rows.append(row)
+
+    scalar_columns: dict[str, Any] = {}
+    for key in sorted(data.files):
+        arr = np.asarray(data[key])
+        if arr.ndim == 0:
+            scalar_columns[key] = _json_friendly(arr)
+
+    frame = pd.DataFrame(rows)
+    for key, value in scalar_columns.items():
+        frame[key] = value
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(dst, index=False, engine="pyarrow")
+
+
+def _export_assets(
+    *,
+    output_dir: Path,
+    cfg: dict[str, Any],
+    final_scene_ply: Path,
+    frontend_head_jsonl: Path,
+    frontend_hands_jsonl: Path,
+    objects_egoallo_parquet: Path,
+    final_motion_npz: Path,
+) -> dict[str, Any]:
+    pointclouds_dir = _assets_pointclouds_dir(output_dir, cfg)
+    poses_dir = _assets_poses_dir(output_dir, cfg)
+    pointclouds_dir.mkdir(parents=True, exist_ok=True)
+    poses_dir.mkdir(parents=True, exist_ok=True)
+
+    final_scene_name = final_scene_ply.name
+    final_scene_asset = pointclouds_dir / final_scene_name
+    if final_scene_ply.resolve() != final_scene_asset.resolve():
+        shutil.copy2(final_scene_ply, final_scene_asset)
+    pointcloud_manifest = pointclouds_dir / "pointclouds.parquet"
+    _write_pointcloud_manifest_parquet(pointcloud_manifest, final_scene_name)
+
+    head_parquet = poses_dir / (frontend_head_jsonl.stem + ".parquet")
+    hands_parquet = poses_dir / (frontend_hands_jsonl.stem + ".parquet")
+    objects_parquet_out = poses_dir / objects_egoallo_parquet.name
+    motion_npz = poses_dir / final_motion_npz.name
+    _write_jsonl_parquet(frontend_head_jsonl, head_parquet, kind="head")
+    _write_jsonl_parquet(frontend_hands_jsonl, hands_parquet, kind="hands")
+    shutil.copy2(objects_egoallo_parquet, objects_parquet_out)
+    shutil.copy2(final_motion_npz, motion_npz)
+
+    return {
+        "pointclouds_dir": str(pointclouds_dir),
+        "final_scene": str(final_scene_asset),
+        "pointcloud_manifest": str(pointcloud_manifest),
+        "poses_dir": str(poses_dir),
+        "head_parquet": str(head_parquet),
+        "hands_parquet": str(hands_parquet),
+        "objects_parquet": str(objects_parquet_out),
+        "motion_npz": str(motion_npz),
+    }
 
 
 def remove_dir_if_requested(name: str, path: Path, enabled: bool) -> dict[str, Any]:
@@ -235,60 +885,208 @@ def configure_python_pycache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: 
     return cache_dir, cleanup_result
 
 
-def _jax_compilation_cache_signature(cfg: dict[str, Any]) -> dict[str, Any]:
+def _package_version(package_name: str) -> str | None:
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _visible_cuda_devices() -> dict[str, Any]:
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is None or cuda_visible_devices.strip() == "":
+        visible_tokens: list[str] | None = None
+    elif cuda_visible_devices.strip() in {"-1", "none", "None"}:
+        visible_tokens = []
+    else:
+        visible_tokens = [token.strip() for token in cuda_visible_devices.split(",") if token.strip()]
+
+    detected_gpus: list[dict[str, str]] = []
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader,nounits"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            parts = [part.strip() for part in line.split(",", 1)]
+            if len(parts) == 2 and parts[0] != "":
+                detected_gpus.append({"index": parts[0], "name": parts[1]})
+
+    if visible_tokens is None:
+        visible_gpus = detected_gpus
+    else:
+        by_index = {gpu["index"]: gpu for gpu in detected_gpus}
+        visible_gpus = [by_index[token] for token in visible_tokens if token in by_index]
+
     return {
-        "egoallo": {
-            "target_segment_length": get_cfg(cfg, "egoallo.target_segment_length", 256),
-            "context_frames": get_cfg(cfg, "egoallo.context_frames", 0),
-            "guidance_mode": get_cfg(cfg, "egoallo.guidance_mode", "hamer_wrist"),
-            "guidance_inner": bool(get_cfg(cfg, "egoallo.guidance_inner", True)),
-            "guidance_post": bool(get_cfg(cfg, "egoallo.guidance_post", True)),
-            "num_samples": get_cfg(cfg, "egoallo.num_samples", 1),
-            "allow_tf32": bool(get_cfg(cfg, "egoallo.allow_tf32", False)),
-            "config": get_cfg(cfg, "egoallo.config", {}),
-        },
-        "temporal_resampling": {
-            "target_fps": get_cfg(cfg, "temporal_resampling.target_fps", 30.0),
-        },
+        "visible_gpu_count": len(visible_gpus) if visible_tokens is None or visible_gpus else len(visible_tokens or []),
+        "visible_gpu_models": [gpu["name"] for gpu in visible_gpus],
+        "detected_gpu_models": [gpu["name"] for gpu in detected_gpus],
     }
+
+
+def _cfg_int(value: Any, default: int) -> int:
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _coerce_egoallo_refine_bucket_t(cfg: dict[str, Any]) -> int:
+    value = get_cfg(cfg, "egoallo_refine.bucket_t", "auto")
+    target_segment_length = _cfg_int(get_cfg(cfg, "egoallo_refine.target_segment_length", 1024), 1024)
+    context_frames = _cfg_int(get_cfg(cfg, "egoallo_refine.context_frames", 36), 36)
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return int(target_segment_length) + 2 * int(context_frames)
+    return _cfg_int(value, 0)
+
+
+def _coerce_egoallo_refine_detection_bucket(cfg: dict[str, Any]) -> int:
+    value = _cfg_int(get_cfg(cfg, "egoallo_refine.detection_bucket", 0), 0)
+    bucket_t = _coerce_egoallo_refine_bucket_t(cfg)
+    return bucket_t if value <= 0 and bucket_t > 0 else value
+
+
+def _jax_compilation_cache_signature(cfg: dict[str, Any], cache_dir: Path | None = None) -> dict[str, Any]:
+    bucket_t = _coerce_egoallo_refine_bucket_t(cfg)
+    detection_bucket = _coerce_egoallo_refine_detection_bucket(cfg)
+    return {
+        "signature_schema": 17,
+        "compile_tags": {
+            "JAX_COMPILATION_CACHE_DIR": str(cache_dir) if cache_dir is not None else None,
+            "jaxlib_version": _package_version("jaxlib"),
+            "jax_version": _package_version("jax"),
+            "cuda": _visible_cuda_devices(),
+            # Torch input references/postprocessing do not change this JAX guidance graph.
+            "pipeline": "native_egoallo_contact_only_legs",
+            "guidance_mode": get_cfg(cfg, "egoallo_refine.guidance_mode", "hamer_reproj2"),
+            "target_segment_length": get_cfg(cfg, "egoallo_refine.target_segment_length", 1024),
+            "context_frames": get_cfg(cfg, "egoallo_refine.context_frames", 36),
+            "guidance_inner": True,
+            "guidance_post": True,
+            "inner_max_iters": get_cfg(cfg, "egoallo_refine.inner_max_iters", 2),
+            "post_max_iters": get_cfg(cfg, "egoallo_refine.post_max_iters", 16),
+            "egoallo_initialization": "full_noise_head_conditioned_egoallo",
+            "wrist_guidance": True,
+            "hand_pose_guidance": True,
+            "guidance_shape": "mean_native_betas_excluding_padding",
+            "window_size": get_cfg(cfg, "egoallo_refine.window_size", 128),
+            "ddim_eta": 0.8,
+            "bucket_t": bucket_t,
+            "detection_bucket": detection_bucket,
+            "hand_detection_pytree": {
+                "root_keys": ["T_cpf_cam", "detections_left_concat", "detections_right_concat"],
+                "side_keys": [
+                    "keypoints_3d",
+                    "mano_hand_global_orient",
+                    "single_hand_quats",
+                    "constraint_weight",
+                    "hand_pose_weight",
+                    "hand_reproj_weight",
+                    "wrist_pose_weight",
+                    "indices",
+                ],
+                "float_dtype": "float32",
+                "index_dtype": "int64",
+                "per_side_padded_detection_count": detection_bucket,
+                "left_right_detection_counts_fixed_by_padding": True,
+            },
+        },
+        "runtime_tags": {
+            "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+            "hamer_abspos_weight": get_cfg(cfg, "egoallo_refine.hamer_abspos_weight", 20.0),
+        },
+        "egoallo_refine": get_cfg(cfg, "egoallo_refine", {}),
+    }
+
+
+def _jax_compilation_cache_compile_key(signature: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(signature, dict):
+        return None
+    compile_tags = signature.get("compile_tags")
+    if not isinstance(compile_tags, dict):
+        compile_tags = {}
+    compile_tag_keys = (
+        "JAX_COMPILATION_CACHE_DIR",
+        "jaxlib_version",
+        "jax_version",
+        "pipeline",
+        "guidance_mode",
+        "target_segment_length",
+        "context_frames",
+        "guidance_inner",
+        "guidance_post",
+        "inner_max_iters",
+        "post_max_iters",
+        "egoallo_initialization",
+        "wrist_guidance",
+        "hand_pose_guidance",
+        "ddim_eta",
+        "guidance_shape",
+        "window_size",
+        "bucket_t",
+        "detection_bucket",
+        "hand_detection_pytree",
+    )
+    return {
+        "signature_schema": signature.get("signature_schema"),
+        "compile_tags": {key: compile_tags.get(key) for key in compile_tag_keys},
+    }
+
+
+def _is_safe_cache_dir_to_clear(cache_dir: Path, project_root: Path) -> tuple[bool, str]:
+    cache_dir = cache_dir.expanduser().resolve()
+    project_root = project_root.expanduser().resolve()
+    forbidden = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        project_root,
+        project_root.parent.resolve(),
+    }
+    if cache_dir in forbidden:
+        return False, "cache_dir_is_forbidden_root"
+    if len(cache_dir.parts) < 3:
+        return False, "cache_dir_too_shallow"
+    return True, "ok"
 
 
 def _maybe_reset_jax_cache_for_signature(cache_dir: Path, cfg: dict[str, Any], project_root: Path) -> dict[str, Any]:
     reset_enabled = _cfg_bool(
-        get_cfg(cfg, "jax_guidance.compilation_cache.reset_on_signature_mismatch", False),
-        default=False,
+        get_cfg(cfg, "jax_guidance.compilation_cache.reset_on_signature_mismatch", True),
+        default=True,
     )
     signature_file_name = str(
-        get_cfg(
-            cfg,
-            "jax_guidance.compilation_cache.signature_file",
-            ".egoallo_jax_cache_signature.json",
-        )
+        get_cfg(cfg, "jax_guidance.compilation_cache.signature_file", ".egoallo_jax_cache_signature.json")
     )
-    signature = _jax_compilation_cache_signature(cfg)
+    signature = _jax_compilation_cache_signature(cfg, cache_dir)
     result = {
         "enabled": bool(reset_enabled),
         "cache_dir": str(cache_dir),
         "signature_file": str(cache_dir / signature_file_name),
         "reset": False,
+        "reuse": False,
+        "regenerate": False,
         "reason": "disabled",
     }
     if not reset_enabled:
-        return result
-
-    try:
-        cache_dir.relative_to(project_root)
-    except ValueError:
-        result["reason"] = "cache_dir_outside_project_root"
-        print(f"[JAX] Skip cache reset for safety: {cache_dir}", flush=True)
-        return result
-    if cache_dir == project_root:
-        result["reason"] = "cache_dir_is_project_root"
-        print(f"[JAX] Skip cache reset for safety: {cache_dir}", flush=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with (cache_dir / signature_file_name).open("w", encoding="utf-8") as f:
+            json.dump(signature, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
         return result
 
     signature_path = cache_dir / signature_file_name
     old_signature = None
+    cache_exists = cache_dir.exists()
     if signature_path.exists():
         try:
             with signature_path.open("r", encoding="utf-8") as f:
@@ -296,13 +1094,22 @@ def _maybe_reset_jax_cache_for_signature(cache_dir: Path, cfg: dict[str, Any], p
         except Exception:
             old_signature = None
 
-    if cache_dir.exists() and old_signature != signature:
+    if cache_exists and _jax_compilation_cache_compile_key(old_signature) == _jax_compilation_cache_compile_key(signature):
+        result["reuse"] = True
+        result["reason"] = "signature_match"
+        return result
+
+    if cache_exists:
+        safe, reason = _is_safe_cache_dir_to_clear(cache_dir, project_root)
+        if not safe:
+            raise RuntimeError(f"Refuse to clear unsafe JAX cache directory: {cache_dir} ({reason})")
         shutil.rmtree(cache_dir)
         result["reset"] = True
         result["reason"] = "signature_mismatch" if old_signature is not None else "missing_or_invalid_signature"
     else:
-        result["reason"] = "signature_match"
+        result["reason"] = "cache_missing"
 
+    result["regenerate"] = True
     cache_dir.mkdir(parents=True, exist_ok=True)
     with signature_path.open("w", encoding="utf-8") as f:
         json.dump(signature, f, ensure_ascii=False, indent=2, sort_keys=True)
@@ -310,33 +1117,35 @@ def _maybe_reset_jax_cache_for_signature(cache_dir: Path, cfg: dict[str, Any], p
     return result
 
 
-def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tmp_dir: Path, project_root: Path) -> Path | None:
-    """Enable JAX persistent compilation cache before EgoAllo/JAX guidance starts."""
-    enabled = _cfg_bool(
-        get_cfg(cfg, "jax_guidance.compilation_cache.enabled", True),
-        default=True,
-    )
+def configure_jax_compilation_cache(
+    env: dict[str, str],
+    cfg: dict[str, Any],
+    tmp_dir: Path,
+    project_root: Path,
+) -> Path | None:
+    enabled = _cfg_bool(get_cfg(cfg, "jax_guidance.compilation_cache.enabled", True), default=True)
     if not enabled:
         return None
 
-    configured_cache_dir = get_cfg(cfg, "jax_guidance.compilation_cache.cache_dir", None)
+    configured_cache_dir = get_cfg(cfg, "jax_guidance.compilation_cache.output_path", None)
+    if configured_cache_dir is None:
+        configured_cache_dir = get_cfg(cfg, "jax_guidance.compilation_cache.cache_dir", None)
     if configured_cache_dir:
         cache_dir = Path(str(configured_cache_dir)).expanduser()
         if not cache_dir.is_absolute():
             cache_dir = project_root / cache_dir
         cache_dir = cache_dir.resolve()
     else:
-        cache_subdir = str(
-            get_cfg(
-                cfg,
-                "jax_guidance.compilation_cache.cache_subdir",
-                "jax_worker_cache",
-            )
-        )
+        cache_subdir = str(get_cfg(cfg, "jax_guidance.compilation_cache.cache_subdir", "jax_worker_cache"))
         cache_dir = (tmp_dir / cache_subdir).expanduser().resolve()
+
     reset_result = _maybe_reset_jax_cache_for_signature(cache_dir, cfg, project_root)
     if reset_result["reset"]:
         print(f"[JAX] Persistent compilation cache reset: {cache_dir} reason={reset_result['reason']}", flush=True)
+    elif reset_result["reuse"]:
+        print(f"[JAX] Persistent compilation cache reused: {cache_dir}", flush=True)
+    elif reset_result["regenerate"]:
+        print(f"[JAX] Persistent compilation cache initialized: {cache_dir} reason={reset_result['reason']}", flush=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     env["JAX_ENABLE_COMPILATION_CACHE"] = "true"
@@ -348,23 +1157,21 @@ def configure_jax_compilation_cache(env: dict[str, str], cfg: dict[str, Any], tm
         get_cfg(cfg, "jax_guidance.compilation_cache.min_entry_size_bytes", -1)
     )
     env["JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES"] = str(
-        get_cfg(
-            cfg,
-            "jax_guidance.compilation_cache.enable_xla_caches",
-            "xla_gpu_per_fusion_autotune_cache_dir",
-        )
+        get_cfg(cfg, "jax_guidance.compilation_cache.enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
     )
 
     if _cfg_bool(get_cfg(cfg, "jax_guidance.compilation_cache.explain_cache_misses", False)):
         env["JAX_EXPLAIN_CACHE_MISSES"] = "true"
-
     if _cfg_bool(get_cfg(cfg, "jax_guidance.compilation_cache.debug_log_modules", False)):
         env["JAX_DEBUG_LOG_MODULES"] = "jax._src.compiler,jax._src.lru_cache"
         env["JAX_LOGGING_LEVEL"] = "DEBUG"
 
-    # Export to both env keys for legacy import paths in EgoAllo code.
     env["EGOALLO_JAX_COMPILATION_CACHE_DIR"] = str(cache_dir)
+    env["EGOALLO_JAX_CACHE_LOG"] = str(tmp_dir / "jax_cache_hits.log")
     env["EGOALLO_JAX_CACHE_RESET_REASON"] = str(reset_result["reason"])
+    env["EGOALLO_JAX_CACHE_SIGNATURE_FILE"] = str(reset_result["signature_file"])
+    env["EGOALLO_JAX_CACHE_REUSED"] = "1" if reset_result["reuse"] else "0"
+    env["EGOALLO_JAX_CACHE_REGENERATED"] = "1" if reset_result["regenerate"] else "0"
 
     print(f"[JAX] Persistent compilation cache enabled: {cache_dir}", flush=True)
     return cache_dir
@@ -481,6 +1288,20 @@ def read_json_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def _redact_metric_scale_result_for_log(metric_scale_result: Any) -> Any:
+    if isinstance(metric_scale_result, dict):
+        out = {}
+        for k, v in metric_scale_result.items():
+            if k == "per_bone_scale_meta":
+                continue
+            out[k] = _redact_metric_scale_result_for_log(v)
+        return out
+    if isinstance(metric_scale_result, list):
+        return [_redact_metric_scale_result_for_log(v) for v in metric_scale_result]
+    return metric_scale_result
+
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
@@ -493,44 +1314,75 @@ def main() -> None:
         (SCRIPT_03_STABILIZE_HANDS, "03_stabilize_hawor_hands_for_egoallo.py"),
         (SCRIPT_EXTRACT_ROT, "extract_hawor_to_vggt_rotation.py"),
         (SCRIPT_04_BUILD_HAMER, "04_build_egoallo_hamer_from_hawor_world.py"),
+        (SCRIPT_PREPARE_REAL_SENSOR, "04_prepare_real_sensor_inputs.py"),
         (SCRIPT_05_APPLY_SCALE, "05_apply_metric_scale.py"),
-        (SCRIPT_05B_RESAMPLE, "05b_resample_egoallo_inputs.py"),
         (SCRIPT_RUN_GEOCALIB, "run_geocalib.py"),
         (SCRIPT_ESTIMATE_GRAVITY, "01_estimate_gravity_da3_geocalib.py"),
         (SCRIPT_APPLY_ALIGNMENT, "02_apply_alignment_da3_geocalib.py"),
-        (SCRIPT_VALIDATE_POSE_BEFORE_EGOALLO, "05c_validate_pose_before_egoallo.py"),
-        (SCRIPT_RUN_EGOALLO, "05_run_egoallo.sh"),
-        (SCRIPT_SMOOTH_EGOALLO, "06_smooth_egoallo_segments.py"),
+        (SCRIPT_VALIDATE_POSE_BEFORE_EGOGVAE, "05c_validate_pose_before_egogvae.py"),
+        (SCRIPT_RUN_EGOGVAE, "05_run_egogvae_from_head.py"),
+        (SCRIPT_RUN_EGOALLO_REFINE, "07_run_egoallo_refine_with_prior.py"),
     ]:
         require_file(script, name)
-
-    frames_dir = args.frames_dir.expanduser().resolve()
-    cam_space_dir = args.cam_space_dir.expanduser().resolve()
-    hawor_hands_vggt_world = args.hawor_hands_vggt_world.expanduser().resolve()
-    hawor_to_vggt_alignment = args.hawor_to_vggt_alignment.expanduser().resolve()
-    vggt_head_pose = args.vggt_head_pose.expanduser().resolve()
-    scene_points_ply = args.scene_points_ply.expanduser().resolve()
+    episode_dir = args.episode_dir.expanduser().resolve()
+    downstream_dir = args.downstream_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prepared_dir = output_dir / "tmp" / "upstream_converted"
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    upstream = _prepare_upstream_inputs(
+        episode_dir=episode_dir,
+        downstream_dir=downstream_dir,
+        prepared_dir=prepared_dir,
+        frame_count=int(get_cfg(cfg, "geocalib.num_samples", 30)),
+    )
+    frames_dir = upstream.frames_dir
+    cam_space_dir = upstream.cam_space_dir
+    hawor_hands_vggt_world = upstream.hawor_hands_vggt_world
+    hawor_to_vggt_alignment = upstream.hawor_to_vggt_alignment
+    vggt_head_pose = upstream.vggt_head_pose
+    scene_points_ply = upstream.scene_points_ply
+    objects_parquet = upstream.objects_parquet
+    object_meshes = upstream.object_meshes
+    real_sensor_input = resolve_real_sensor_input(episode_dir)
+    real_sensor_has_imu = real_sensor_input is not None and episode_imu_path(real_sensor_input) is not None
+    real_sensor_has_depth = real_sensor_input is not None and episode_has_depth_stream(real_sensor_input)
+    real_sensor_rgb_stream_id = None
+    real_sensor_depth_stream_id = None
+    if real_sensor_input is not None:
+        configured_rgb_stream = str(get_cfg(cfg, "real_sensor.rgb_camera_stream_id", "auto"))
+        real_sensor_rgb_stream_id = (
+            episode_stream_id(real_sensor_input, "rgb")
+            if configured_rgb_stream == "auto"
+            else configured_rgb_stream
+        )
+        if real_sensor_rgb_stream_id is None:
+            raise ValueError("No RGB stream found in episode.json")
+        if real_sensor_has_depth:
+            configured_depth_stream = str(get_cfg(cfg, "real_sensor.depth_camera_stream_id", "auto"))
+            real_sensor_depth_stream_id = (
+                episode_stream_id(real_sensor_input, "depth")
+                if configured_depth_stream == "auto"
+                else configured_depth_stream
+            )
+            if real_sensor_depth_stream_id is None:
+                raise ValueError("No depth stream found in episode.json")
 
     require_dir(frames_dir, "frames_dir")
     require_file(vggt_head_pose, "vggt_head_pose")
     require_file(scene_points_ply, "scene_points_ply")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = output_dir / str(get_cfg(cfg, "output_layout.tmp_dir_name", "tmp"))
-    egoallo_inputs_dir = output_dir / str(get_cfg(cfg, "output_layout.egoallo_inputs_dir_name", "egoallo_inputs"))
-    egoallo_outputs_dir = output_dir / str(get_cfg(cfg, "output_layout.egoallo_outputs_dir_name", "egoallo_outputs"))
-    ego_tmp_dir = output_dir / str(get_cfg(cfg, "output_layout.ego_tmp_dir_name", "ego_tmp"))
+    egogvae_inputs_dir = output_dir / str(get_cfg(cfg, "output_layout.egogvae_inputs_dir_name", "egogvae_inputs"))
+    egogvae_outputs_dir = output_dir / str(get_cfg(cfg, "output_layout.egogvae_outputs_dir_name", "egogvae_outputs"))
+    egogvae_tmp_dir = output_dir / str(get_cfg(cfg, "output_layout.egogvae_tmp_dir_name", "egogvae_tmp"))
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    egoallo_inputs_dir.mkdir(parents=True, exist_ok=True)
-    egoallo_outputs_dir.mkdir(parents=True, exist_ok=True)
-    ego_tmp_dir.mkdir(parents=True, exist_ok=True)
+    egogvae_inputs_dir.mkdir(parents=True, exist_ok=True)
+    egogvae_outputs_dir.mkdir(parents=True, exist_ok=True)
+    egogvae_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # Keep Python bytecode cache out of project source directories.
     python_pycache_dir, python_pycache_cleanup = configure_python_pycache(env, cfg, tmp_dir)
-
-    # JAX guidance persistent compilation cache must be configured before EgoAllo starts.
-    # It is configured before any subprocess can launch EgoAllo/JAX guidance.
     jax_compilation_cache_dir = configure_jax_compilation_cache(env, cfg, tmp_dir, PROJECT_ROOT)
 
     global PIPELINE_RECORDER
@@ -540,11 +1392,12 @@ def main() -> None:
         metadata={
             "project_root": str(PROJECT_ROOT),
             "config_path": str(args.config.expanduser().resolve()),
+            "config_snapshot": cfg,
             "output_dir": str(output_dir),
             "tmp_dir": str(tmp_dir),
-            "egoallo_inputs_dir": str(egoallo_inputs_dir),
-            "egoallo_outputs_dir": str(egoallo_outputs_dir),
-            "ego_tmp_dir": str(ego_tmp_dir),
+            "egogvae_inputs_dir": str(egogvae_inputs_dir),
+            "egogvae_outputs_dir": str(egogvae_outputs_dir),
+            "egogvae_tmp_dir": str(egogvae_tmp_dir),
             "python_executable": sys.executable,
             "python_pycache_dir": str(python_pycache_dir) if python_pycache_dir is not None else None,
             "python_pycache_cleanup": python_pycache_cleanup,
@@ -556,12 +1409,13 @@ def main() -> None:
                 "hawor_to_vggt_alignment": str(hawor_to_vggt_alignment),
                 "vggt_head_pose": str(vggt_head_pose),
                 "scene_points_ply": str(scene_points_ply),
+                "real_sensor_input": str(real_sensor_input) if real_sensor_input is not None else None,
             },
         },
     )
 
     camera_poses_txt = tmp_dir / "camera_poses.txt"
-    timestamps_txt = egoallo_inputs_dir / "timestamps.txt"
+    timestamps_txt = egogvae_inputs_dir / "timestamps.txt"
     intrinsics_txt = tmp_dir / "intrinsics.txt"
 
     prepared_hands_jsonl = tmp_dir / "hawor_hands_for_egoallo_world.jsonl"
@@ -571,26 +1425,49 @@ def main() -> None:
     empty_hawor_hands_vggt_world = tmp_dir / "empty_hawor_hands_vggt_world.jsonl"
 
     geocalib_gravity_npz = tmp_dir / "geocalib_gravity.npz"
+    imu_gravity_txt = tmp_dir / "imu_gravity.txt"
     R_align_npy = tmp_dir / "R_align.npy"
     alignment_transform_npz = tmp_dir / "alignment_transform.npz"
     aligned_scene_ply = tmp_dir / "aligned_scene.ply"
     head_trajectory_tmp = tmp_dir / "head_trajectory.npy"
 
-    head_trajectory_out = egoallo_inputs_dir / "head_trajectory.npy"
-    hamer_outputs_pkl_out = egoallo_inputs_dir / "hamer_outputs.pkl"
+    head_trajectory_out = egogvae_inputs_dir / "head_trajectory.npy"
+    hamer_outputs_pkl_out = egogvae_inputs_dir / "hamer_outputs.pkl"
     final_scene_name = str(get_cfg(cfg, "output_layout.final_scene_name", "final_scene.ply"))
-    final_scene_ply = egoallo_outputs_dir / final_scene_name
-    final_smoothed_name = str(get_cfg(cfg, "output_layout.final_smoothed_name", "merged_smoothed_vis.npz"))
-    final_smoothed_npz = egoallo_outputs_dir / final_smoothed_name
-    motion_quality_report_json = tmp_dir / str(get_cfg(cfg, "smooth.report_json_name", "motion_quality_report.json"))
+    final_scene_ply = _assets_pointclouds_dir(output_dir, cfg) / final_scene_name
+    egogvae_motion_name = str(get_cfg(cfg, "output_layout.egogvae_motion_name", "egogvae_motion.npz"))
+    egogvae_motion_npz = egogvae_outputs_dir / egogvae_motion_name
+    final_smoothed_npz = egogvae_outputs_dir / FINAL_MOTION_NAME
+    frontend_head_name = str(
+        get_cfg(cfg, "metric_scale.frontend.head_jsonl_name", "head_trajectory_egoallo.jsonl")
+    )
+    frontend_hands_name = str(
+        get_cfg(cfg, "metric_scale.frontend.hands_jsonl_name", "hand_keypoints_egoallo.jsonl")
+    )
+    frontend_head_jsonl = egogvae_outputs_dir / frontend_head_name
+    frontend_hands_jsonl = egogvae_outputs_dir / frontend_hands_name
+    objects_egoallo_parquet = egogvae_outputs_dir / "objects_egoallo.parquet"
+    object_mesh_outputs = [
+        mesh.parent / f"{mesh.stem}_egoallo.glb"
+        for mesh in object_meshes
+    ]
+    motion_quality_report_json = tmp_dir / str(get_cfg(cfg, "egogvae.report_json_name", "motion_quality_report.json"))
+    egoallo_refine_report_json = tmp_dir / str(get_cfg(cfg, "egoallo_refine.report_json_name", "egoallo_refine_report.json"))
+    egoallo_hawor_cache_npz = tmp_dir / str(get_cfg(cfg, "egoallo_refine.cache_npz_name", "egoallo_hawor_final_cache.npz"))
     pose_validation_report_json = tmp_dir / str(get_cfg(cfg, "pose_validation.report_json_name", "pose_validation_report.json"))
     pose_validation_result: dict[str, Any] = {
         "enabled": False,
         "status": "disabled",
-        "should_run_egoallo": True,
+        "should_run_egogvae": True,
     }
-    egoallo_inference_skipped = False
+    egoallo_refine_result: dict[str, Any] = {
+        "enabled": _cfg_bool(get_cfg(cfg, "egoallo_refine.enabled", True), default=True),
+        "status": "not_run",
+    }
+    egogvae_inference_skipped = False
     metric_scale_metadata_json = tmp_dir / "metric_scale_metadata.json"
+    real_depth_scale_json = tmp_dir / "real_depth_scale_estimate.json"
+    real_imu_alignment_failed = False
 
     mano_left = resolve_project_path(get_cfg(cfg, "model_weights.mano_left_pkl"))
     mano_right = resolve_project_path(get_cfg(cfg, "model_weights.mano_right_pkl"))
@@ -608,6 +1485,24 @@ def main() -> None:
         "--timestamps-path", str(timestamps_txt),
         "--intrinsics-path", str(intrinsics_txt),
     ], env=env)
+
+    if real_sensor_input is not None:
+        # timestamps.txt lets the IMU step attach its stationary window to the pose
+        # captured at the same time, instead of always using the first pose.
+        real_sensor_prepare_cmd = [
+            py,
+            str(SCRIPT_PREPARE_REAL_SENSOR),
+            "--episode-dir", str(real_sensor_input),
+            "--camera-stream-id", str(real_sensor_rgb_stream_id),
+            "--intrinsics-out", str(intrinsics_txt),
+            "--imu-gravity-out", str(imu_gravity_txt),
+            "--timestamps-txt", str(timestamps_txt),
+            "--imu-stationary-window-sec", str(get_cfg(cfg, "real_sensor.imu_stationary_window_sec", 0.5)),
+            "--imu-stationary-max-gyro", str(get_cfg(cfg, "real_sensor.imu_stationary_max_gyro", 0.25)),
+            "--imu-stationary-max-dir-spread-deg", str(get_cfg(cfg, "real_sensor.imu_stationary_max_dir_spread_deg", 3.0)),
+            "--imu-stationary-max-norm-rel-dev", str(get_cfg(cfg, "real_sensor.imu_stationary_max_norm_rel_dev", 0.05)),
+        ]
+        run(real_sensor_prepare_cmd, env=env)
 
     if hawor_hands_vggt_world.is_file():
         hands_jsonl_for_pipeline = hawor_hands_vggt_world
@@ -627,7 +1522,7 @@ def main() -> None:
             flush=True,
         )
 
-    # 02: HaWoR world hands -> EgoAllo prepared hands
+    # 02: HaWoR world hands -> prepared hand records for scale/frontend outputs.
     cmd = [
         py,
         str(SCRIPT_02_EXTRACT_HANDS),
@@ -640,12 +1535,26 @@ def main() -> None:
         "--max-wrist-step-hand-ratio", str(get_cfg(cfg, "hawor_extract.max_wrist_step_hand_ratio", 2.0)),
         "--min-track-len", str(get_cfg(cfg, "hawor_extract.min_track_len", 3)),
         "--trim-segment-edges", str(get_cfg(cfg, "hawor_extract.trim_segment_edges", 0)),
-        "--max-gap-fill", str(get_cfg(cfg, "hawor_extract.max_gap_fill", 3)),
+        "--max-gap-fill", str(get_cfg(cfg, "hawor_extract.max_gap_fill", 0)),
         "--max-gap-endpoint-hand-ratio", str(get_cfg(cfg, "hawor_extract.max_gap_endpoint_hand_ratio", 1.5)),
         "--smooth-window", str(get_cfg(cfg, "hawor_extract.smooth_window", 5)),
         "--smooth-mode", str(get_cfg(cfg, "hawor_extract.smooth_mode", "translation")),
         "--soft-start-anchor-max-gap", str(get_cfg(cfg, "hawor_extract.soft_start_anchor_max_gap", 45)),
+        "--local-mad-window", str(get_cfg(cfg, "hawor_extract.local_mad_window", 7)),
+        "--local-mad-multiplier", str(get_cfg(cfg, "hawor_extract.local_mad_multiplier", 6.0)),
+        "--local-mad-min-samples", str(get_cfg(cfg, "hawor_extract.local_mad_min_samples", 4)),
     ]
+    hand_filter_enabled = bool(get_cfg(cfg, "hand_filter.enabled", False))
+    if hand_filter_enabled:
+        cmd.extend([
+            "--near-hand-filter",
+            "--near-hand-distance-ratio", str(get_cfg(cfg, "hand_filter.near_distance_ratio", 3.0)),
+            "--near-hand-min-support", str(get_cfg(cfg, "hand_filter.min_support", 3)),
+            "--near-hand-max-gap-seconds", str(get_cfg(cfg, "hand_filter.max_gap_seconds", 0.6)),
+            "--near-hand-max-speed-hand-lengths", str(get_cfg(cfg, "hand_filter.max_speed_hand_lengths", 20.0)),
+            "--near-hand-max-distance-change-ratio", str(get_cfg(cfg, "hand_filter.max_distance_change_ratio", 1.5)),
+            "--near-hand-ambiguity-ratio", str(get_cfg(cfg, "hand_filter.ambiguity_ratio", 1.25)),
+        ])
     add_flag(cmd, "--drop-isolated", get_cfg(cfg, "hawor_extract.drop_isolated", True))
     if not bool(get_cfg(cfg, "hawor_extract.drop_isolated", True)):
         cmd.append("--no-drop-isolated")
@@ -661,12 +1570,16 @@ def main() -> None:
         str(SCRIPT_03_STABILIZE_HANDS),
         "--input-jsonl", str(prepared_hands_jsonl),
         "--output-jsonl", str(stable_hands_jsonl),
+        "--max-flip-dist-ratio", str(get_cfg(cfg, "hawor_stabilize.max_flip_dist_ratio", 1.5)),
         "--max-wrist-step-hand-ratio", str(get_cfg(cfg, "hawor_stabilize.max_wrist_step_hand_ratio", 2.0)),
+        "--local-mad-window", str(get_cfg(cfg, "hawor_stabilize.local_mad_window", 7)),
+        "--local-mad-multiplier", str(get_cfg(cfg, "hawor_stabilize.local_mad_multiplier", 6.0)),
+        "--local-mad-min-samples", str(get_cfg(cfg, "hawor_stabilize.local_mad_min_samples", 4)),
         "--min-track-len", str(get_cfg(cfg, "hawor_stabilize.min_track_len", 4)),
         "--soft-start-frames", str(get_cfg(cfg, "hawor_stabilize.soft_start_frames", 15)),
         "--soft-end-frames", str(get_cfg(cfg, "hawor_stabilize.soft_end_frames", 6)),
         "--min-alpha-to-keep", str(get_cfg(cfg, "hawor_stabilize.min_alpha_to_keep", 0.0)),
-        "--duplicate-mode", str(get_cfg(cfg, "hawor_stabilize.duplicate_mode", "drop_both")),
+        "--duplicate-mode", str(get_cfg(cfg, "hawor_stabilize.duplicate_mode", "keep_best")),
     ], env=env)
 
     # HaWoR -> VGGT rotation. If no hands were detected upstream, the alignment
@@ -675,11 +1588,13 @@ def main() -> None:
         py,
         str(SCRIPT_EXTRACT_ROT),
         "--alignment-json", str(hawor_to_vggt_alignment),
+        "--json-key", "sim3.R",
+        "--transpose",
         "--output-npy", str(R_hawor_to_vggt_npy),
         "--missing-is-identity",
     ], env=env)
 
-    # 04: build EgoAllo hamer pkl from HaWoR world hands
+    # 04: build hamer pkl from HaWoR world hands for scale/frontend outputs.
     run([
         py,
         str(SCRIPT_04_BUILD_HAMER),
@@ -696,72 +1611,92 @@ def main() -> None:
         "--camera-frame-rotation-npy", str(R_hawor_to_vggt_npy),
     ], env=env)
 
-    # GeoCalib gravity：可选参数从 YAML 的 geocalib 段读取。
-    geocalib_cmd = [
-        py,
-        str(SCRIPT_RUN_GEOCALIB),
-        "--img-dir", str(frames_dir),
-        "--output", str(geocalib_gravity_npz),
-        "--device", str(get_cfg(cfg, "geocalib.device", "auto")),
-        "--num-samples", str(get_cfg(cfg, "geocalib.num_samples", 30)),
-        "--anchor-policy", str(get_cfg(cfg, "geocalib.anchor_policy", "top_k_best_uncertainty")),
-        "--top-k-anchors", str(get_cfg(cfg, "geocalib.top_k_anchors", 3)),
-        "--follow-frames", str(get_cfg(cfg, "geocalib.follow_frames", 5)),
-        "--empty-policy", str(get_cfg(cfg, "geocalib.empty_policy", "skip")),
-    ]
-    geocalib_min_confidence = get_cfg(cfg, "geocalib.min_confidence", None)
-    if geocalib_min_confidence is not None:
-        geocalib_cmd.extend(["--min-confidence", str(geocalib_min_confidence)])
+    if not real_sensor_has_imu:
+        # GeoCalib gravity：可选参数从 YAML 的 geocalib 段读取。
+        geocalib_cmd = [
+            py,
+            str(SCRIPT_RUN_GEOCALIB),
+            "--img-dir", str(frames_dir),
+            "--output", str(geocalib_gravity_npz),
+            "--device", str(get_cfg(cfg, "geocalib.device", "auto")),
+            "--num-samples", str(get_cfg(cfg, "geocalib.num_samples", 30)),
+            "--anchor-policy", str(get_cfg(cfg, "geocalib.anchor_policy", "top_k_best_uncertainty")),
+            "--top-k-anchors", str(get_cfg(cfg, "geocalib.top_k_anchors", 3)),
+            "--empty-policy", str(get_cfg(cfg, "geocalib.empty_policy", "skip")),
+        ]
+        geocalib_min_confidence = get_cfg(cfg, "geocalib.min_confidence", None)
+        if geocalib_min_confidence is not None:
+            geocalib_cmd.extend(["--min-confidence", str(geocalib_min_confidence)])
 
-    if bool(get_cfg(cfg, "geocalib.viz_enabled", False)):
-        viz_dir_name = str(get_cfg(cfg, "geocalib.viz_dir_name", "geocalib_viz"))
-        # GeoCalib 可视化图保存到 tmp 下。
-        # 注意：如果 output_layout.cleanup_tmp=true，则完整 pipeline 成功后 tmp 会被删除，
-        # 这些可视化图片也会一起删除；调试时可把 cleanup_tmp 设为 false。
-        geocalib_viz_dir = tmp_dir / viz_dir_name
-        geocalib_cmd.extend(["--viz-dir", str(geocalib_viz_dir)])
-        if bool(get_cfg(cfg, "geocalib.viz_save_all_sampled", True)):
-            geocalib_cmd.append("--save-all-sampled-viz")
-        if bool(get_cfg(cfg, "geocalib.viz_save_selected", False)):
-            geocalib_cmd.append("--save-selected-viz")
+        if bool(get_cfg(cfg, "geocalib.viz_enabled", False)):
+            viz_dir_name = str(get_cfg(cfg, "geocalib.viz_dir_name", "geocalib_viz"))
+            geocalib_viz_dir = tmp_dir / viz_dir_name
+            geocalib_cmd.extend(["--viz-dir", str(geocalib_viz_dir)])
+            if bool(get_cfg(cfg, "geocalib.viz_save_all_sampled", True)):
+                geocalib_cmd.append("--save-all-sampled-viz")
+            if bool(get_cfg(cfg, "geocalib.viz_save_selected", False)):
+                geocalib_cmd.append("--save-selected-viz")
 
-    # geocalib_root 透传给 01_estimate_gravity_da3_geocalib.py，由其决定源码/conda回退逻辑。
-    geocalib_root = env.get("GEOCALIB_ROOT")
-    if geocalib_root:
-        geocalib_cmd.extend(["--geocalib-root", geocalib_root])
-    if env.get("GEOCALIB_PINHOLE_TAR"):
-        geocalib_cmd.extend(["--geocalib-pinhole-weight", env["GEOCALIB_PINHOLE_TAR"]])
+        geocalib_root = env.get("GEOCALIB_ROOT")
+        if geocalib_root:
+            geocalib_cmd.extend(["--geocalib-root", geocalib_root])
+        if env.get("GEOCALIB_PINHOLE_TAR"):
+            geocalib_cmd.extend(["--geocalib-pinhole-weight", env["GEOCALIB_PINHOLE_TAR"]])
 
-    run(geocalib_cmd, env=env)
+        run(geocalib_cmd, env=env)
 
     # Gravity alignment
-    # GeoCalib is optional. When enabled, 01_estimate_gravity_da3_geocalib.py
-    # still computes a point-cloud-only RANSAC baseline first. GeoCalib is only
-    # used as a prior when it disagrees with RANSAC beyond the switch angle, and
-    # the resulting floor/up proposal must pass camera-height validation or it
-    # will fall back to RANSAC.
+    # Two different modes inside 01_estimate_gravity_da3_geocalib.py:
+    #
+    # 1. Real IMU (real_sensor_has_imu): the measured vertical, taken from
+    #    the most stationary IMU window, restricts the floor search to the low region
+    #    along that axis. The final up still comes from refine_floor_coarse_to_fine,
+    #    which must stay within imu_max_refine_angle_deg of the IMU axis. If every
+    #    candidate misses that limit, downstream inputs are still exported and EgoGVAE
+    #    inference is skipped.
+    #
+    # 2. No IMU: point-cloud-only RANSAC baseline first. GeoCalib is optional and is
+    #    used only as a prior when it disagrees with RANSAC beyond the switch angle,
+    #    and the resulting floor/up proposal must pass camera-height validation or it
+    #    will fall back to RANSAC.
     estimate_gravity_cmd = [
         py,
         str(SCRIPT_ESTIMATE_GRAVITY),
         "--pcd", str(scene_points_ply),
         "--poses", str(camera_poses_txt),
+        "--hands-jsonl", str(stable_hands_jsonl),
+        "--timestamps", str(timestamps_txt),
         "--out", str(R_align_npy),
         "--out_meta", str(alignment_transform_npz),
     ]
 
-    if bool(get_cfg(cfg, "alignment.use_geocalib_prior", True)):
+    if real_sensor_has_imu:
         estimate_gravity_cmd.extend([
-            "--geocalib_gravity", str(geocalib_gravity_npz),
-            "--geocalib_vector_type", str(get_cfg(cfg, "alignment.geocalib_vector_type", "gravity")),
-            "--geocalib_switch_angle_deg", str(get_cfg(cfg, "alignment.geocalib_switch_angle_deg", 10.0)),
-            "--geocalib_outlier_angle_deg", str(get_cfg(cfg, "alignment.geocalib_outlier_angle_deg", 15.0)),
+            "--imu_gravity", str(imu_gravity_txt),
+            "--imu_vector_type", str(get_cfg(cfg, "real_sensor.imu_vector_type", "up")),
+            "--imu_min_camera_above_hand_ratio", str(get_cfg(cfg, "real_sensor.imu_min_camera_above_hand_ratio", 0.5)),
+            "--imu_outlier_angle_deg", str(get_cfg(cfg, "real_sensor.imu_outlier_angle_deg", 180.0)),
+            "--imu_max_refine_angle_deg", str(get_cfg(cfg, "real_sensor.imu_max_refine_angle_deg", 10.0)),
+            "--imu_max_head_height_rel_spread", str(get_cfg(cfg, "real_sensor.imu_max_head_height_rel_spread", 0.75)),
+            "--imu_max_points_below_floor_ratio", str(get_cfg(cfg, "real_sensor.imu_max_points_below_floor_ratio", 0.05)),
+            "--imu_min_head_span_ratio", str(get_cfg(cfg, "real_sensor.imu_min_head_span_ratio", 0.15)),
+            "--imu_max_head_span_ratio", str(get_cfg(cfg, "real_sensor.imu_max_head_span_ratio", 2.50)),
         ])
+    else:
+        # GeoCalib-only switches. In IMU mode they have no effect, so they are not passed.
+        if bool(get_cfg(cfg, "alignment.use_geocalib_prior", True)):
+            estimate_gravity_cmd.extend([
+                "--geocalib_gravity", str(geocalib_gravity_npz),
+                "--geocalib_vector_type", str(get_cfg(cfg, "alignment.geocalib_vector_type", "gravity")),
+                "--geocalib_switch_angle_deg", str(get_cfg(cfg, "alignment.geocalib_switch_angle_deg", 10.0)),
+                "--geocalib_outlier_angle_deg", str(get_cfg(cfg, "alignment.geocalib_outlier_angle_deg", 15.0)),
+            ])
 
-    if bool(get_cfg(cfg, "alignment.geocalib_precheck_height", True)):
-        estimate_gravity_cmd.append("--geocalib_precheck_height")
+        if bool(get_cfg(cfg, "alignment.geocalib_precheck_height", True)):
+            estimate_gravity_cmd.append("--geocalib_precheck_height")
 
-    if bool(get_cfg(cfg, "alignment.fallback_to_ransac_on_invalid_height", True)):
-        estimate_gravity_cmd.append("--fallback_to_ransac_on_invalid_height")
+        if bool(get_cfg(cfg, "alignment.fallback_to_ransac_on_invalid_height", True)):
+            estimate_gravity_cmd.append("--fallback_to_ransac_on_invalid_height")
 
     estimate_gravity_cmd.extend([
         "--min_valid_camera_height_margin_factor",
@@ -774,6 +1709,25 @@ def main() -> None:
 
     run(estimate_gravity_cmd, env=env)
 
+    alignment_decision: dict[str, Any] = {}
+    if real_sensor_has_imu:
+        alignment_decision = read_imu_alignment_decision(alignment_transform_npz)
+        print(
+            "[IMU] alignment outcome: "
+            f"used_imu={alignment_decision.get('used_imu_gravity')} "
+            f"accepted={alignment_decision.get('accepted')} "
+            f"candidates={alignment_decision.get('num_candidates_tried')} "
+            f"reason={alignment_decision.get('decision_reason')}",
+            flush=True,
+        )
+        if alignment_decision.get("accepted") is False:
+            real_imu_alignment_failed = True
+            print(
+                "[IMU] alignment failed; still exporting aligned inputs/scene, "
+                "then EgoGVAE inference will be skipped.",
+                flush=True,
+            )
+
     run([
         py,
         str(SCRIPT_APPLY_ALIGNMENT),
@@ -784,111 +1738,124 @@ def main() -> None:
         "--poses-only",
     ], env=env)
 
-    # Optional MoGe metric-scale estimation.
-    # MoGe is expensive, so it is deferred until after a lightweight hands-only
-    # scale probe. If hands are selected successfully, MoGe is skipped.
-    moge_scale_json: Path | None = None
-    moge_output_dir: Path | None = None
+    # Optional FoundationGeo metric-scale estimation from gravity-aligned ground depth.
+    # 05_apply_metric_scale.py takes max(FoundationGeo, hands), then caps p90 head height.
+    foundationgeo_scale_json: Path | None = None
+    foundationgeo_output_dir: Path | None = None
     metric_scale_enabled = bool(get_cfg(cfg, "metric_scale.enabled", True))
-    moge_enabled = metric_scale_enabled and bool(get_cfg(cfg, "metric_scale.moge.enabled", False))
-    moge_model_pt: Path | None = None
-    if moge_enabled:
-        require_file(SCRIPT_ESTIMATE_MOGE_SCALE, "04_estimate_moge_metric_scale.py")
-        moge_output_dir = tmp_dir / str(get_cfg(cfg, "metric_scale.moge.output_dir_name", "moge_metric_scale"))
-        moge_scale_json = moge_output_dir / "moge_scale_estimate.json"
-        moge_model_pt = resolve_project_path(get_cfg(cfg, "model_weights.moge_model_pt", env.get("MOGE_MODEL_PT")))
+    real_depth_scale_ok = False
+    real_depth_scale_reason = "not_run"
+    foundationgeo_enabled = (
+        metric_scale_enabled
+        and bool(get_cfg(cfg, "metric_scale.foundationgeo.enabled", False))
+    )
+    foundationgeo_model_pt: Path | None = None
+    if foundationgeo_enabled:
+        require_file(SCRIPT_ESTIMATE_FOUNDATIONGEO_SCALE, "04_estimate_foundationgeo_metric_scale.py")
+        foundationgeo_output_dir = tmp_dir / str(get_cfg(cfg, "metric_scale.foundationgeo.output_dir_name", "foundationgeo_metric_scale"))
+        foundationgeo_scale_json = foundationgeo_output_dir / "foundationgeo_scale_estimate.json"
+        foundationgeo_model_pt = resolve_project_path(get_cfg(cfg, "model_weights.foundationgeo_model_pt", env.get("FOUNDATIONGEO_MODEL_PT")))
 
-    def run_alignment_point_cloud_for_moge() -> Path:
-        moge_aligned_scene_ply = tmp_dir / "aligned_scene_for_moge.ply"
-        run([
-            py,
-            str(SCRIPT_APPLY_ALIGNMENT),
-            "--pcd", str(scene_points_ply),
-            "--poses", str(camera_poses_txt),
-            "--R", str(R_align_npy),
-            "--align_meta", str(alignment_transform_npz),
-            "--out_pcd", str(moge_aligned_scene_ply),
-            "--out_poses", str(tmp_dir / "head_trajectory_for_moge.npy"),
-            "--output_voxel_size", str(get_cfg(
-                cfg,
-                "metric_scale.moge.aligned_scene_voxel_size",
-                get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01),
-            )),
-        ], env=env)
-        return moge_aligned_scene_ply
-
-    def run_moge_metric_scale_if_needed() -> None:
-        if not moge_enabled or moge_scale_json is None:
+    def run_foundationgeo_metric_scale_if_needed() -> None:
+        if not foundationgeo_enabled or foundationgeo_scale_json is None:
             return
-        if moge_model_pt is None:
+        if foundationgeo_model_pt is None:
             write_failed_scale_json(
-                moge_scale_json,
-                source="moge",
-                reason="model_weights.moge_model_pt_not_set",
+                foundationgeo_scale_json,
+                source="foundationgeo",
+                reason="model_weights.foundationgeo_model_pt_not_set",
             )
-            print(f"[MoGe] Skip MoGe scale: model_weights.moge_model_pt is not set. Wrote {moge_scale_json}", flush=True)
-        elif not moge_model_pt.is_file():
+            print(f"[FoundationGeo] Skip FoundationGeo scale: model_weights.foundationgeo_model_pt is not set. Wrote {foundationgeo_scale_json}", flush=True)
+        elif not foundationgeo_model_pt.is_file():
             write_failed_scale_json(
-                moge_scale_json,
-                source="moge",
-                reason="moge_model_pt_not_found",
-                extra={"moge_model_pt": str(moge_model_pt)},
+                foundationgeo_scale_json,
+                source="foundationgeo",
+                reason="foundationgeo_model_pt_not_found",
+                extra={"foundationgeo_model_pt": str(foundationgeo_model_pt)},
             )
-            print(f"[MoGe] Skip MoGe scale: model.pt not found: {moge_model_pt}. Wrote {moge_scale_json}", flush=True)
+            print(f"[FoundationGeo] Skip FoundationGeo scale: model.pt not found: {foundationgeo_model_pt}. Wrote {foundationgeo_scale_json}", flush=True)
         else:
-            moge_point_cloud_in = run_alignment_point_cloud_for_moge()
-            moge_cmd = [
+            foundationgeo_cmd = [
                 py,
-                str(SCRIPT_ESTIMATE_MOGE_SCALE),
+                str(SCRIPT_ESTIMATE_FOUNDATIONGEO_SCALE),
                 "--frames-dir", str(frames_dir),
                 "--timestamps-txt", str(timestamps_txt),
                 "--head-trajectory-in", str(head_trajectory_tmp),
-                "--point-cloud-in", str(moge_point_cloud_in),
                 "--intrinsics-path", str(intrinsics_txt),
-                "--moge-model-pt", str(moge_model_pt),
-                "--output-dir", str(moge_output_dir),
-                "--output-json", str(moge_scale_json),
-                "--candidate-samples", str(get_cfg(cfg, "metric_scale.moge.candidate_samples", 48)),
-                "--num-samples", str(get_cfg(cfg, "metric_scale.moge.num_samples", 24)),
-                "--min-quality-brightness", str(get_cfg(cfg, "metric_scale.moge.min_quality_brightness", 25.0)),
-                "--max-quality-brightness", str(get_cfg(cfg, "metric_scale.moge.max_quality_brightness", 235.0)),
-                "--max-quality-dark-ratio", str(get_cfg(cfg, "metric_scale.moge.max_quality_dark_ratio", 0.45)),
-                "--max-quality-bright-ratio", str(get_cfg(cfg, "metric_scale.moge.max_quality_bright_ratio", 0.45)),
-                "--min-quality-laplacian-var", str(get_cfg(cfg, "metric_scale.moge.min_quality_laplacian_var", 20.0)),
-                "--min-quality-texture-std", str(get_cfg(cfg, "metric_scale.moge.min_quality_texture_std", 8.0)),
-                "--min-quality-edge-density", str(get_cfg(cfg, "metric_scale.moge.min_quality_edge_density", 0.01)),
-                "--quality-edge-threshold", str(get_cfg(cfg, "metric_scale.moge.quality_edge_threshold", 20.0)),
-                "--min-valid-frames", str(get_cfg(cfg, "metric_scale.moge.min_valid_frames", 6)),
-                "--min-valid-pixels", str(get_cfg(cfg, "metric_scale.moge.min_valid_pixels", 1000)),
-                "--min-depth-m", str(get_cfg(cfg, "metric_scale.moge.min_depth_m", 0.2)),
-                "--max-depth-m", str(get_cfg(cfg, "metric_scale.moge.max_depth_m", 8.0)),
-                "--min-scale", str(get_cfg(cfg, "metric_scale.moge.min_scale", 0.05)),
-                "--max-scale", str(get_cfg(cfg, "metric_scale.moge.max_scale", 20.0)),
-                "--max-frame-relative-mad", str(get_cfg(cfg, "metric_scale.moge.max_frame_relative_mad", 0.35)),
-                "--max-final-relative-mad", str(get_cfg(cfg, "metric_scale.moge.max_final_relative_mad", 0.35)),
-                "--max-points", str(get_cfg(cfg, "metric_scale.moge.max_points", 250000)),
-                "--max-saved-match-pixels", str(get_cfg(cfg, "metric_scale.moge.max_saved_match_pixels", 200000)),
-                "--projection-quality-enabled", str(get_cfg(cfg, "metric_scale.moge.projection_quality_enabled", True)),
-                "--min-projection-area-ratio", str(get_cfg(cfg, "metric_scale.moge.min_projection_area_ratio", 0.01)),
-                "--min-depth-range-m", str(get_cfg(cfg, "metric_scale.moge.min_depth_range_m", 0.25)),
-                "--min-depth-layer-ratio", str(get_cfg(cfg, "metric_scale.moge.min_depth_layer_ratio", 0.03)),
-                "--min-depth-layer-count", str(get_cfg(cfg, "metric_scale.moge.min_depth_layer_count", 2)),
-                "--max-center-region-ratio", str(get_cfg(cfg, "metric_scale.moge.max_center_region_ratio", 0.90)),
-                "--min-static-background-score", str(get_cfg(cfg, "metric_scale.moge.min_static_background_score", 0.35)),
-                "--device", str(get_cfg(cfg, "metric_scale.moge.device", "cuda")),
-                "--fp16", str(get_cfg(cfg, "metric_scale.moge.fp16", True)),
-                "--resolution-level", str(get_cfg(cfg, "metric_scale.moge.resolution_level", 9)),
-                "--use-intrinsics-fov", str(get_cfg(cfg, "metric_scale.moge.use_intrinsics_fov", True)),
-                "--save-depth-maps", str(get_cfg(cfg, "metric_scale.moge.save_depth_maps", True)),
-                "--save-projection-matches", str(get_cfg(cfg, "metric_scale.moge.save_projection_matches", True)),
-                "--save-sampled-frames", str(get_cfg(cfg, "metric_scale.moge.save_sampled_frames", False)),
+                "--foundationgeo-model-pt", str(foundationgeo_model_pt),
+                "--output-dir", str(foundationgeo_output_dir),
+                "--output-json", str(foundationgeo_scale_json),
+                "--num-samples", str(get_cfg(cfg, "metric_scale.foundationgeo.num_samples", 32)),
+                "--depth-scale-cluster-rel-tol", str(get_cfg(cfg, "metric_scale.foundationgeo.depth_scale_cluster_rel_tol", 0.08)),
+                "--depth-scale-min-support-frames", str(get_cfg(cfg, "metric_scale.foundationgeo.depth_scale_min_support_frames", 3)),
+                "--device", str(get_cfg(cfg, "metric_scale.foundationgeo.device", "cuda")),
+                "--fp16", str(get_cfg(cfg, "metric_scale.foundationgeo.fp16", False)),
+                "--resolution-level", str(get_cfg(cfg, "metric_scale.foundationgeo.resolution_level", 9)),
             ]
-            moge_num_tokens = get_cfg(cfg, "metric_scale.moge.num_tokens", None)
-            if moge_num_tokens is not None:
-                moge_cmd.extend(["--num-tokens", str(moge_num_tokens)])
-            if bool(get_cfg(cfg, "metric_scale.moge.strict", False)):
-                moge_cmd.append("--strict")
-            run(moge_cmd, env=env)
+            foundationgeo_num_tokens = get_cfg(cfg, "metric_scale.foundationgeo.num_tokens", None)
+            if foundationgeo_num_tokens is not None:
+                foundationgeo_cmd.extend(["--num-tokens", str(foundationgeo_num_tokens)])
+            if bool(get_cfg(cfg, "metric_scale.foundationgeo.strict", False)):
+                foundationgeo_cmd.append("--strict")
+            run(foundationgeo_cmd, env=env)
+
+    hand_scale_bones_json = tmp_dir / "hand_scale_bones.json"
+
+    metric_scale_cmd = [
+        py,
+        str(SCRIPT_05_APPLY_SCALE),
+        "--head-trajectory-in", str(head_trajectory_tmp),
+        "--point-cloud-in", str(scene_points_ply),
+        "--hamer-pkl-in", str(hamer_outputs_pkl_tmp),
+        "--point-cloud-space", "raw_vggt",
+        "--point-cloud-r-align", str(R_align_npy),
+        "--point-cloud-align-meta", str(alignment_transform_npz),
+        "--final-scene-output-voxel-size", str(get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.0)),
+        "--head-trajectory-out", str(head_trajectory_out),
+        "--point-cloud-out", str(final_scene_ply),
+        "--objects-parquet-in", str(objects_parquet),
+        "--objects-parquet-out", str(objects_egoallo_parquet),
+        "--hamer-pkl-out", str(hamer_outputs_pkl_out),
+        "--metadata-out", str(metric_scale_metadata_json),
+        "--floor-z", str(get_cfg(cfg, "metric_scale.floor_z", 0.0)),
+        "--hand-scale-enabled", "1" if bool(get_cfg(cfg, "metric_scale.hands.enabled", True)) and not real_sensor_has_depth else "0",
+        "--hand-scale-bones-json", str(hand_scale_bones_json),
+        "--hand-scale-min-valid-bones", str(get_cfg(cfg, "metric_scale.hands.min_valid_bones", 20)),
+        "--hand-scale-max-relative-mad", str(get_cfg(cfg, "metric_scale.hands.max_relative_mad", 0.35)),
+        "--hand-scale-min-scale", str(get_cfg(cfg, "metric_scale.hands.min_scale", 0.05)),
+        "--hand-scale-max-scale", str(get_cfg(cfg, "metric_scale.hands.max_scale", 20.0)),
+        "--max-p90-head-height", str(get_cfg(cfg, "metric_scale.max_p90_head_height", 1.60)),
+        "--hands-vggt-jsonl-for-scale", str(stable_hands_jsonl),
+        "--R-align-for-scale", str(R_align_npy),
+        "--align-meta-for-scale", str(alignment_transform_npz),
+    ]
+
+    for mesh_in, mesh_out in zip(object_meshes, object_mesh_outputs):
+        metric_scale_cmd.extend([
+            "--object-mesh-in", str(mesh_in),
+            "--object-mesh-out", str(mesh_out),
+        ])
+
+    if hand_filter_enabled:
+        metric_scale_cmd.extend([
+            "--hand-max-camera-distance-m", str(get_cfg(cfg, "hand_filter.max_camera_distance_m", 1.2)),
+        ])
+    if bool(get_cfg(cfg, "metric_scale.frontend.enabled", True)):
+        metric_scale_cmd.extend([
+            "--export-frontend-jsonl",
+            "--frontend-output-dir", str(egogvae_outputs_dir),
+            "--frontend-head-jsonl-name", frontend_head_name,
+            "--frontend-hands-jsonl-name", frontend_hands_name,
+            "--timestamps-txt", str(timestamps_txt),
+            "--hands-vggt-jsonl-in", str(hawor_hands_vggt_world),
+            "--R-align", str(R_align_npy),
+            "--align-meta", str(alignment_transform_npz),
+        ])
+        add_flag(
+            metric_scale_cmd,
+            "--frontend-include-mesh",
+            get_cfg(cfg, "metric_scale.frontend.include_mesh", False),
+        )
 
     # Metric scale
     # 05_apply_metric_scale.py no longer reads YAML directly. run_body_mesh.py is the single
@@ -897,122 +1864,63 @@ def main() -> None:
         hand_scale_bones_json = tmp_dir / "hand_scale_bones.json"
         with hand_scale_bones_json.open("w", encoding="utf-8") as f:
             json.dump(
-                get_cfg(cfg, "metric_scale.hand_fallback.bones", []),
+                get_cfg(cfg, "metric_scale.hands.bones", []),
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
 
-        scale_priority_csv = cfg_list_to_csv(
-            get_cfg(cfg, "metric_scale.scale_priority", None),
-            ["hands", "moge", "height", "none"],
-        )
-        metric_scale_cmd = [
-            py,
-            str(SCRIPT_05_APPLY_SCALE),
-            "--head-trajectory-in", str(head_trajectory_tmp),
-            "--point-cloud-in", str(scene_points_ply),
-            "--hamer-pkl-in", str(hamer_outputs_pkl_tmp),
-            "--point-cloud-space", "raw_vggt",
-            "--point-cloud-r-align", str(R_align_npy),
-            "--point-cloud-align-meta", str(alignment_transform_npz),
-            "--final-scene-output-voxel-size", str(get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01)),
-            "--head-trajectory-out", str(head_trajectory_out),
-            "--point-cloud-out", str(final_scene_ply),
-            "--hamer-pkl-out", str(hamer_outputs_pkl_out),
-            "--metadata-out", str(metric_scale_metadata_json),
-            "--floor-z", str(get_cfg(cfg, "metric_scale.floor_z", 0.0)),
-            "--scale-priority", scale_priority_csv,
-            "--hand-scale-enabled", "1" if bool(get_cfg(cfg, "metric_scale.hand_fallback.enabled", True)) else "0",
-            "--hand-scale-bones-json", str(hand_scale_bones_json),
-            "--hand-scale-min-valid-bones", str(get_cfg(cfg, "metric_scale.hand_fallback.min_valid_bones", 20)),
-            "--hand-scale-max-relative-mad", str(get_cfg(cfg, "metric_scale.hand_fallback.max_relative_mad", 0.35)),
-            "--hand-scale-min-scale", str(get_cfg(cfg, "metric_scale.hand_fallback.min_scale", 0.05)),
-            "--hand-scale-max-scale", str(get_cfg(cfg, "metric_scale.hand_fallback.max_scale", 20.0)),
-            "--hand-max-p90-head-height", str(get_cfg(cfg, "metric_scale.hand_fallback.max_p90_head_height", 1.70)),
-
-            "--scale-sanity-enabled", "1" if bool(get_cfg(cfg, "metric_scale.scale_sanity.enabled", True)) else "0",
-            "--scale-sanity-statistic", str(get_cfg(cfg, "metric_scale.scale_sanity.statistic", "percentile")),
-            "--scale-sanity-percentile", str(get_cfg(cfg, "metric_scale.scale_sanity.percentile", 90.0)),
-            "--scale-sanity-min-valid-head-height", str(get_cfg(cfg, "metric_scale.scale_sanity.min_valid_head_height", 0.8)),
-            "--scale-sanity-max-valid-head-height", str(get_cfg(cfg, "metric_scale.scale_sanity.max_valid_head_height", 2.4)),
-            "--scale-sanity-reject-moge-if-invalid-height", "1" if bool(get_cfg(cfg, "metric_scale.scale_sanity.reject_moge_if_invalid_height", True)) else "0",
-            "--scale-sanity-reject-hands-if-invalid-height", "1" if bool(get_cfg(cfg, "metric_scale.scale_sanity.reject_hands_if_invalid_height", True)) else "0",
-
-            "--height-fallback-enabled", "1" if bool(get_cfg(cfg, "metric_scale.height_fallback.enabled", True)) else "0",
-            "--height-fallback-mode", str(get_cfg(cfg, "metric_scale.height_fallback.mode", "standing_head_height")),
-            "--height-fallback-statistic", str(get_cfg(cfg, "metric_scale.height_fallback.statistic", "percentile")),
-            "--height-fallback-percentile", str(get_cfg(cfg, "metric_scale.height_fallback.percentile", 90.0)),
-            "--height-fallback-min-valid-height", str(get_cfg(cfg, "metric_scale.height_fallback.min_valid_height", 1.0)),
-            "--height-fallback-max-valid-height", str(get_cfg(cfg, "metric_scale.height_fallback.max_valid_height", 2.3)),
-            "--height-fallback-min-candidate-frames", str(get_cfg(cfg, "metric_scale.height_fallback.min_candidate_frames", 10)),
-            "--height-fallback-min-scale", str(get_cfg(cfg, "metric_scale.height_fallback.min_scale", 0.05)),
-            "--height-fallback-max-scale", str(get_cfg(cfg, "metric_scale.height_fallback.max_scale", 20.0)),
-            "--height-fallback-smooth-window", str(get_cfg(cfg, "metric_scale.height_fallback.smooth_window", 1)),
-
-            "--hands-vggt-jsonl-for-scale", str(hands_jsonl_for_pipeline),
-            "--R-align-for-scale", str(R_align_npy),
-            "--align-meta-for-scale", str(alignment_transform_npz),
-        ]
-
-        height_fallback_target_height = get_cfg(cfg, "metric_scale.height_fallback.target_height", None)
-        if height_fallback_target_height is not None:
-            metric_scale_cmd.extend(["--height-fallback-target-height", str(height_fallback_target_height)])
-
-        if bool(get_cfg(cfg, "metric_scale.frontend.enabled", True)):
-            metric_scale_cmd.extend([
-                "--export-frontend-jsonl",
-                "--frontend-output-dir", str(egoallo_outputs_dir),
-                "--frontend-head-jsonl-name", str(get_cfg(cfg, "metric_scale.frontend.head_jsonl_name", "head_trajectory_egoallo.jsonl")),
-                "--frontend-hands-jsonl-name", str(get_cfg(cfg, "metric_scale.frontend.hands_jsonl_name", "hand_keypoints_egoallo.jsonl")),
+        if real_sensor_has_depth:
+            run([
+                py,
+                str(SCRIPT_PREPARE_REAL_SENSOR),
+                "--episode-dir", str(real_sensor_input),
+                "--camera-stream-id", str(real_sensor_depth_stream_id),
+                "--scale-json", str(real_depth_scale_json),
                 "--timestamps-txt", str(timestamps_txt),
-                "--hands-vggt-jsonl-in", str(hands_jsonl_for_pipeline),
-                "--R-align", str(R_align_npy),
-                "--align-meta", str(alignment_transform_npz),
-            ])
-            add_flag(
-                metric_scale_cmd,
-                "--frontend-include-mesh",
-                get_cfg(cfg, "metric_scale.frontend.include_mesh", False),
-            )
-
-        priority_items = [x.strip().lower() for x in scale_priority_csv.split(",") if x.strip()]
-        hands_before_moge = (
-            "hands" in priority_items
-            and "moge" in priority_items
-            and priority_items.index("hands") < priority_items.index("moge")
-        )
-        run_moge_scale = bool(moge_enabled and "moge" in priority_items)
-        if run_moge_scale and hands_before_moge and bool(get_cfg(cfg, "metric_scale.hand_fallback.enabled", True)):
-            hand_probe_json = tmp_dir / "metric_scale_hand_probe.json"
-            hand_probe_cmd = list(metric_scale_cmd)
-            hand_probe_cmd[hand_probe_cmd.index("--metadata-out") + 1] = str(hand_probe_json)
-            hand_probe_cmd[hand_probe_cmd.index("--scale-priority") + 1] = "hands"
-            hand_probe_cmd.append("--probe-scale-only")
-            run(hand_probe_cmd, env=env)
+                "--head-trajectory-in", str(head_trajectory_tmp),
+                "--point-cloud-r-align", str(R_align_npy),
+                "--point-cloud-align-meta", str(alignment_transform_npz),
+                "--depth-unit-scale", str(get_cfg(cfg, "real_sensor.depth_unit_scale", 1.0)),
+                "--num-samples", str(get_cfg(cfg, "real_sensor.depth_scale_num_samples", 64)),
+                "--depth-scale-cluster-rel-tol", str(get_cfg(cfg, "real_sensor.depth_scale_cluster_rel_tol", 0.08)),
+                "--depth-scale-min-support-frames", str(get_cfg(cfg, "real_sensor.depth_scale_min_support_frames", 3)),
+                "--depth-scale-local-window", str(get_cfg(cfg, "real_sensor.depth_scale_local_window", 15)),
+                "--depth-scale-local-min-support-frames", str(get_cfg(cfg, "real_sensor.depth_scale_local_min_support_frames", 5)),
+            ], env=env)
             try:
-                with hand_probe_json.open("r", encoding="utf-8") as f:
-                    hand_probe = json.load(f)
-                hand_probe_source = hand_probe.get("scale_source")
+                with real_depth_scale_json.open("r", encoding="utf-8") as f:
+                    real_depth_data = json.load(f)
+                real_depth_scale = finite_positive_float(real_depth_data.get("scale"))
+                real_depth_scale_ok = (
+                    str(real_depth_data.get("status", "")).lower() in {"ok", "success", "valid"}
+                    and real_depth_scale is not None
+                )
+                real_depth_scale_reason = str(real_depth_data.get("reason") or real_depth_data.get("status") or "unknown")
             except Exception as exc:
-                hand_probe_source = None
-                print(f"[Warning] Failed to read hand scale probe metadata: {exc!r}. Fallback to MoGe.", flush=True)
+                real_depth_scale_ok = False
+                real_depth_scale_reason = f"read_failed: {exc!r}"
 
-            if hand_probe_source == "hands":
-                run_moge_scale = False
-                print("[MoGe] Skip MoGe scale: hands scale probe succeeded.", flush=True)
-            else:
-                print(f"[MoGe] Hands scale probe did not select hands ({hand_probe_source}); run MoGe fallback.", flush=True)
+            if not real_depth_scale_ok:
+                raise RuntimeError(
+                    "[Metric scale] Real depth scale invalid; stop because real sensor depth is present. "
+                    f"reason={real_depth_scale_reason}; report={real_depth_scale_json}"
+                )
 
-        if run_moge_scale:
-            run_moge_metric_scale_if_needed()
-            if moge_scale_json is not None:
-                metric_scale_cmd.extend(["--moge-scale-json", str(moge_scale_json)])
+        if foundationgeo_enabled and not real_depth_scale_ok:
+            run_foundationgeo_metric_scale_if_needed()
+            if foundationgeo_scale_json is not None:
+                metric_scale_cmd.extend(["--depth-scale-json", str(foundationgeo_scale_json)])
+
+        if real_sensor_has_depth and real_depth_scale_ok:
+            metric_scale_cmd.extend(["--depth-scale-json", str(real_depth_scale_json)])
 
         run(metric_scale_cmd, env=env)
     else:
         shutil.copy2(head_trajectory_tmp, head_trajectory_out)
         shutil.copy2(hamer_outputs_pkl_tmp, hamer_outputs_pkl_out)
+        if hand_filter_enabled:
+            print("[Hand filter] metric distance skipped: metric scale is disabled", flush=True)
         run([
             py,
             str(SCRIPT_APPLY_ALIGNMENT),
@@ -1025,32 +1933,16 @@ def main() -> None:
             "--output_voxel_size", str(get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01)),
         ], env=env)
 
-    # Optional temporal resampling: usually from sparse (~5 FPS) to target FPS (default 30 FPS).
-    # Keep this stage in the main pipeline and controlled by temporal_resampling.* in body_mesh.yaml.
-    run([
-        py,
-        str(SCRIPT_05B_RESAMPLE),
-        "--head-trajectory", str(head_trajectory_out),
-        "--timestamps-txt", str(timestamps_txt),
-        "--hamer-pkl", str(hamer_outputs_pkl_out),
-        "--config", str(args.config.expanduser().resolve()),
-        "--tmp-dir", str(tmp_dir),
-        "--output-dir", str(output_dir),
-    ], env=env)
-
     pose_validation_enabled = _cfg_bool(get_cfg(cfg, "pose_validation.enabled", True), default=True)
     if pose_validation_enabled:
         pose_validation_floor_z = get_cfg(cfg, "pose_validation.floor_z", None)
         if pose_validation_floor_z is None:
-            pose_validation_floor_z = get_cfg(cfg, "egoallo.floor_z", None)
+            pose_validation_floor_z = get_cfg(cfg, "egogvae.floor_z", None)
         if pose_validation_floor_z is None:
             pose_validation_floor_z = get_cfg(cfg, "metric_scale.floor_z", 0.0)
-        pose_validation_num_samples = get_cfg(cfg, "egoallo.num_samples", None)
-        if pose_validation_num_samples is None:
-            pose_validation_num_samples = 1
         pose_validation_cmd = [
             py,
-            str(SCRIPT_VALIDATE_POSE_BEFORE_EGOALLO),
+            str(SCRIPT_VALIDATE_POSE_BEFORE_EGOGVAE),
             "--head-trajectory", str(head_trajectory_out),
             "--timestamps-txt", str(timestamps_txt),
             "--hamer-pkl", str(hamer_outputs_pkl_out),
@@ -1058,7 +1950,7 @@ def main() -> None:
             "--report-json", str(pose_validation_report_json),
             "--output-npz", str(final_smoothed_npz),
             "--floor-z", str(pose_validation_floor_z),
-            "--num-samples", str(pose_validation_num_samples),
+            "--num-samples", "1",
         ]
         if _cfg_bool(get_cfg(cfg, "pose_validation.empty_npz_on_fail", True), default=True):
             pose_validation_cmd.append("--write-empty-on-fail")
@@ -1066,136 +1958,290 @@ def main() -> None:
         pose_validation_result = read_json_file(pose_validation_report_json)
         pose_validation_result["enabled"] = True
     else:
-        print("[Pose validation] disabled; continue to EgoAllo inference.", flush=True)
+        print("[Pose validation] disabled; continue to EgoGVAE inference.", flush=True)
 
-    should_run_egoallo = bool(pose_validation_result.get("should_run_egoallo", True))
-    segment_length = str(get_cfg(cfg, "egoallo.target_segment_length", 256))
-
-    # EgoAllo：不再使用 demo/sequence_name，直接使用 output_dir 下的目录。
-    # 05_run_egoallo_from_head.py 的可选参数统一由 YAML 的 egoallo 段控制，
-    # 这里写入环境变量，再由 05_run_egoallo.sh 转成命令行参数。
-    if should_run_egoallo:
-        env["EGOALLO_GUIDANCE_MODE"] = str(get_cfg(cfg, "egoallo.guidance_mode", "hamer_wrist"))
-        env["EGOALLO_GUIDANCE_INNER"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_inner", True)) else "0"
-        env["EGOALLO_GUIDANCE_POST"] = "1" if bool(get_cfg(cfg, "egoallo.guidance_post", True)) else "0"
-        env["EGOALLO_TARGET_SEGMENT_LENGTH"] = segment_length
-        env["EGOALLO_CONTEXT_FRAMES"] = str(get_cfg(cfg, "egoallo.context_frames", 0))
-        env["EGOALLO_SAVE_ONLY_CENTER"] = "1" if bool(get_cfg(cfg, "egoallo.save_only_center", True)) else "0"
-        env["EGOALLO_GLASSES_X_ANGLE_OFFSET"] = str(get_cfg(cfg, "egoallo.glasses_x_angle_offset", 0.0))
-        env["EGOALLO_START_INDEX"] = str(get_cfg(cfg, "egoallo.start_index", 0))
-        env["EGOALLO_SEGMENT_INDEX_OFFSET"] = str(get_cfg(cfg, "egoallo.segment_index_offset", 0))
-        env["EGOALLO_NUM_SAMPLES"] = str(get_cfg(cfg, "egoallo.num_samples", 1))
-        env["EGOALLO_FLOOR_Z"] = str(get_cfg(cfg, "egoallo.floor_z", 0.0))
-        env["EGOALLO_SAVE_TRAJ"] = "1" if bool(get_cfg(cfg, "egoallo.save_traj", True)) else "0"
-        env["EGOALLO_SAVE_ARGS"] = "1" if bool(get_cfg(cfg, "egoallo.save_args", True)) else "0"
-        env["EGOALLO_EMPTY_CACHE_EACH_SEGMENT"] = "1" if bool(get_cfg(cfg, "egoallo.empty_cache_each_segment", False)) else "0"
-        env["EGOALLO_ALLOW_TF32"] = "1" if bool(get_cfg(cfg, "egoallo.allow_tf32", False)) else "0"
-        env["EGOALLO_EXPECTED_HEAD_HEIGHT_MIN"] = str(get_cfg(cfg, "egoallo.expected_head_height_min", 1.0))
-        env["EGOALLO_EXPECTED_HEAD_HEIGHT_MAX"] = str(get_cfg(cfg, "egoallo.expected_head_height_max", 2.2))
-        env["EGOALLO_EGO_CONFIG_PATH"] = str(args.config.expanduser().resolve())
-        env["EGOALLO_JAX_CACHE_LOG"] = str(tmp_dir / "jax_cache_hits.log")
-        if bool(get_cfg(cfg, "egoallo.disable_dlpack", False)):
-            env["EGOALLO_DISABLE_DLPACK"] = "1"
-
-        end_index = get_cfg(cfg, "egoallo.end_index", None)
-        if end_index is not None:
-            env["EGOALLO_END_INDEX"] = str(end_index)
-        else:
-            env.pop("EGOALLO_END_INDEX", None)
-
-        run([
-            "bash",
-            str(SCRIPT_RUN_EGOALLO),
-            str(egoallo_inputs_dir),
-            str(ego_tmp_dir),
-            segment_length,
-        ], env=env)
-
-        # Merge/smooth：从 output_dir/ego_tmp 读取 EgoAllo 分段 .npz，输出到 output_dir/egoallo_outputs。
-        # 06 脚本负责分段接缝 blend 和可选的全局轻量时序平滑。
-        if bool(get_cfg(cfg, "smooth.enabled", True)):
-            smooth_cmd = [
-                py,
-                str(SCRIPT_SMOOTH_EGOALLO),
-                "--input-dir", str(ego_tmp_dir),
-                "--output-dir", str(egoallo_outputs_dir),
-                "--output-name", final_smoothed_name,
-                "--report-json", str(motion_quality_report_json),
-                "--boundary-blend-frames", str(get_cfg(cfg, "smooth.boundary_blend_frames", 0)),
-                "--translation-smooth-window", str(get_cfg(cfg, "smooth.translation_smooth_window", 0)),
-                "--quat-lowpass-alpha", str(get_cfg(cfg, "smooth.quat_lowpass_alpha", 0.0)),
-            ]
-            add_flag(smooth_cmd, "--print-stats", get_cfg(cfg, "smooth.print_stats", True))
-            add_flag(smooth_cmd, "--strict-frame-continuity", get_cfg(cfg, "smooth.strict_frame_continuity", False))
-            run(smooth_cmd, env=env)
-    else:
-        egoallo_inference_skipped = True
+    should_run_egogvae = bool(pose_validation_result.get("should_run_egogvae", True))
+    if real_imu_alignment_failed:
+        should_run_egogvae = False
+        pose_validation_result["should_run_egogvae"] = False
+        pose_validation_result["egogvae_skip_reason"] = alignment_decision.get("decision_reason")
+        write_empty_egogvae_npz(
+            final_smoothed_npz,
+            num_samples=int(get_cfg(cfg, "egoallo_refine.num_samples", 1)),
+            reason=str(alignment_decision.get("decision_reason")),
+        )
         print(
-            "[Pose validation] failed; skip EgoAllo inference and keep empty output: "
+            "[IMU] wrote empty merged EgoGVAE output after alignment failure: "
             f"{final_smoothed_npz}",
             flush=True,
         )
+
+    if should_run_egogvae:
+        egogvae_root = resolve_project_path(get_cfg(cfg, "model_sources.egogvae_root", env.get("EGOGVAE_ROOT")))
+        egoallo_root = resolve_project_path(get_cfg(cfg, "model_sources.egoallo_root", "third_party/egoallo"))
+        egogvae_checkpoint = resolve_project_path(get_cfg(cfg, "model_weights.egogvae_checkpoint_path", env.get("EGOGVAE_CHECKPOINT_PATH")))
+        egoallo_checkpoint_dir = resolve_project_path(
+            get_cfg(
+                cfg,
+                "model_weights.egoallo_checkpoint_dir",
+                "third_party/egoallo/egoallo_checkpoint_april13/checkpoints_3000000",
+            )
+        )
+        smplh_npz_path = resolve_project_path(get_cfg(cfg, "model_weights.smplh_npz_path", env.get("SMPLH_NPZ_PATH")))
+        if egogvae_root is None:
+            raise ValueError("model_sources.egogvae_root is required")
+        if egoallo_root is None:
+            raise ValueError("model_sources.egoallo_root is required")
+        if egogvae_checkpoint is None:
+            raise ValueError("model_weights.egogvae_checkpoint_path is required")
+        if egoallo_checkpoint_dir is None:
+            raise ValueError("model_weights.egoallo_checkpoint_dir is required")
+        if smplh_npz_path is None:
+            raise ValueError("model_weights.smplh_npz_path is required")
+        require_dir(egoallo_root, "egoallo_root")
+        require_file(egoallo_checkpoint_dir / "model.safetensors", "egoallo_checkpoint_dir/model.safetensors")
+
+        egogvae_cmd = [
+            py,
+            str(SCRIPT_RUN_EGOGVAE),
+            "--traj-root",
+            str(egogvae_inputs_dir),
+            "--output-dir",
+            str(egogvae_outputs_dir),
+            "--output-name",
+            egogvae_motion_name,
+            "--report-json",
+            str(motion_quality_report_json),
+            "--egogvae-root",
+            str(egogvae_root),
+            "--checkpoint-path",
+            str(egogvae_checkpoint),
+            "--smplh-npz-path",
+            str(smplh_npz_path),
+            "--device",
+            str(get_cfg(cfg, "egogvae.device", get_cfg(cfg, "runtime.device", "cuda"))),
+            "--window-size",
+            str(get_cfg(cfg, "egogvae.window_size", 128)),
+            "--window-stride",
+            str(get_cfg(cfg, "egogvae.window_stride", 32)),
+            "--start-index",
+            str(get_cfg(cfg, "egogvae.start_index", 0)),
+            "--floor-z",
+            str(get_cfg(cfg, "egogvae.floor_z", get_cfg(cfg, "metric_scale.floor_z", 0.0))),
+            "--latent-mode",
+            str(get_cfg(cfg, "egogvae.latent_mode", "mean")),
+            "--seed",
+            str(get_cfg(cfg, "egogvae.seed", 2025)),
+            "--window-pos-center",
+            str(get_cfg(cfg, "egogvae.window_pos_center", 64.0)),
+            "--window-pos-trusted-lo",
+            str(get_cfg(cfg, "egogvae.window_pos_trusted_lo", 32.0)),
+            "--window-pos-trusted-hi",
+            str(get_cfg(cfg, "egogvae.window_pos_trusted_hi", 96.0)),
+            "--window-pos-weight",
+            str(get_cfg(cfg, "egogvae.window_pos_weight", 1.0)),
+            "--contact-confidence-weight",
+            str(get_cfg(cfg, "egogvae.contact_confidence_weight", 0.0)),
+            "--rotation-weight",
+            str(get_cfg(cfg, "egogvae.rotation_weight", 1.0)),
+            "--foot-position-weight",
+            str(get_cfg(cfg, "egogvae.foot_position_weight", 50.0)),
+            "--contact-jump-weight",
+            str(get_cfg(cfg, "egogvae.contact_jump_weight", 2.0)),
+            "--switch-penalty",
+            str(get_cfg(cfg, "egogvae.switch_penalty", 5.0)),
+            "--same-frame-rotation-weight",
+            str(get_cfg(cfg, "egogvae.same_frame_rotation_weight", 1.0)),
+            "--same-frame-foot-weight",
+            str(get_cfg(cfg, "egogvae.same_frame_foot_weight", 50.0)),
+            "--same-frame-contact-weight",
+            str(get_cfg(cfg, "egogvae.same_frame_contact_weight", 2.0)),
+            "--switch-rotation-threshold-deg",
+            str(get_cfg(cfg, "egogvae.switch_rotation_threshold_deg", 15.0)),
+            "--switch-foot-threshold-m",
+            str(get_cfg(cfg, "egogvae.switch_foot_threshold_m", 0.12)),
+            "--transition-region-min",
+            str(get_cfg(cfg, "egogvae.transition_region_min", 16)),
+            "--transition-region-max",
+            str(get_cfg(cfg, "egogvae.transition_region_max", 32)),
+        ]
+        end_index = get_cfg(cfg, "egogvae.end_index", None)
+        if end_index is not None:
+            egogvae_cmd.extend(["--end-index", str(end_index)])
+        add_flag(egogvae_cmd, "--allow-tf32", get_cfg(cfg, "egogvae.allow_tf32", True))
+        run(egogvae_cmd, env=env)
+
+        if _cfg_bool(get_cfg(cfg, "egoallo_refine.enabled", True), default=True):
+            egoallo_refine_cmd = [
+                py, str(SCRIPT_RUN_EGOALLO_REFINE),
+                "--reference-motion-npz", str(egogvae_motion_npz),
+                "--hamer-outputs-path", str(hamer_outputs_pkl_out),
+                "--output-dir", str(egogvae_outputs_dir),
+                "--report-json", str(egoallo_refine_report_json),
+                "--egoallo-root", str(egoallo_root),
+                "--checkpoint-dir", str(egoallo_checkpoint_dir),
+                "--smplh-npz-path", str(smplh_npz_path),
+                "--floor-z", str(get_cfg(cfg, "egogvae.floor_z", get_cfg(cfg, "metric_scale.floor_z", 0.0))),
+                "--egoallo-cache-npz", str(egoallo_hawor_cache_npz),
+            ]
+            refine_defaults = {
+                "guidance_mode": "hamer_reproj2", "device": "cuda",
+                "num_samples": 1, "random_seed": 2025,
+                "lower_body_reference_strength": 1.0, "lower_body_reference_seed": 7819,
+                "target_segment_length": 1024, "context_frames": 36,
+                "window_size": 128, "overlap_size": 32,
+                "hamer_abspos_weight": 20.0, "bucket_t": "auto", "detection_bucket": 0,
+                "inner_max_iters": 2, "inner_last_steps": 0, "inner_step_frequency": 1,
+                "post_max_iters": 16, "post_last_steps": 0, "post_step_frequency": 1,
+                "body_smoothing_max_deg": 5.0, "leg_max_iters": 250, "contact_source": "egogvae",
+                "grounding_max_iters": 200, "grounding_spine_max_deg": 8.0,
+                "grounding_leg_max_deg": 12.0, "grounding_smoothing_seconds": 0.08,
+                "grounding_foot_xy_max_m": 0.05, "grounding_foot_rotation_max_deg": 8.0,
+                "leg_max_correction_deg": 3.0,
+                "hand_refinement_max_deg": 0.0,
+            }
+            for name, default in refine_defaults.items():
+                egoallo_refine_cmd.extend(["--" + name.replace("_", "-"), str(get_cfg(cfg, "egoallo_refine." + name, default))])
+            add_flag(egoallo_refine_cmd, "--verbose", get_cfg(cfg, "egoallo_refine.verbose", False))
+            run(egoallo_refine_cmd, env=env)
+            egoallo_refine_result = read_json_file(egoallo_refine_report_json)
+            egoallo_refine_result["enabled"] = True
+        else:
+            shutil.copy2(egogvae_motion_npz, final_smoothed_npz)
+            egoallo_refine_result = {
+                "enabled": False,
+                "status": "disabled",
+                "output_npz": str(final_smoothed_npz),
+            }
+    else:
+        egogvae_inference_skipped = True
+        if real_imu_alignment_failed:
+            print(
+                "[IMU] alignment failed; skip EgoGVAE inference and keep exported files.",
+                flush=True,
+            )
+        else:
+            print(
+                "[Pose validation] failed; skip EgoGVAE inference and keep empty output: "
+                f"{final_smoothed_npz}",
+                flush=True,
+            )
 
     metric_scale_result = None
     if metric_scale_metadata_json.is_file():
         try:
             with metric_scale_metadata_json.open("r", encoding="utf-8") as f:
                 metric_scale_result = json.load(f)
+            metric_scale_result = _redact_metric_scale_result_for_log(metric_scale_result)
         except Exception as exc:
             metric_scale_result = {"status": "metadata_read_failed", "error": repr(exc)}
 
+    assets = _export_assets(
+        output_dir=output_dir,
+        cfg=cfg,
+        final_scene_ply=final_scene_ply,
+        frontend_head_jsonl=frontend_head_jsonl,
+        frontend_hands_jsonl=frontend_hands_jsonl,
+        objects_egoallo_parquet=objects_egoallo_parquet,
+        final_motion_npz=final_smoothed_npz,
+    )
+
     summary = {
         "status": "completed",
+        "completion_reason": (
+            "real_imu_alignment_failed_skip_egogvae"
+            if real_imu_alignment_failed
+            else "completed"
+        ),
         "project_root": str(PROJECT_ROOT),
         "output_dir": str(output_dir),
         "tmp_dir": str(tmp_dir),
-        "egoallo_inputs_dir": str(egoallo_inputs_dir),
-        "egoallo_outputs_dir": str(egoallo_outputs_dir),
-        "ego_tmp_dir": str(ego_tmp_dir),
+        "egogvae_inputs_dir": str(egogvae_inputs_dir),
+        "egogvae_outputs_dir": str(egogvae_outputs_dir),
+        "egogvae_tmp_dir": str(egogvae_tmp_dir),
+        "assets": assets,
         "python_cache": {
             "pycache_prefix": env.get("PYTHONPYCACHEPREFIX"),
             "cleanup_existing_scripts_pycache": python_pycache_cleanup,
         },
+        "jax_guidance": {
+            "compilation_cache_enabled": env.get("JAX_ENABLE_COMPILATION_CACHE") == "true",
+            "compilation_cache_dir": env.get("JAX_COMPILATION_CACHE_DIR"),
+            "compilation_cache_signature_file": env.get("EGOALLO_JAX_CACHE_SIGNATURE_FILE"),
+            "compilation_cache_status": env.get("EGOALLO_JAX_CACHE_RESET_REASON"),
+            "compilation_cache_reused": env.get("EGOALLO_JAX_CACHE_REUSED") == "1",
+            "compilation_cache_regenerated": env.get("EGOALLO_JAX_CACHE_REGENERATED") == "1",
+            "min_compile_time_secs": env.get("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"),
+            "min_entry_size_bytes": env.get("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"),
+            "enable_xla_caches": env.get("JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES"),
+        },
         "model_sources": {
-            "egoallo_root_fallback": env.get("EGOALLO_ROOT"),
+            "egogvae_root": env.get("EGOGVAE_ROOT"),
             "geocalib_root_fallback": env.get("GEOCALIB_ROOT"),
-            "moge_root_fallback": env.get("MOGE_ROOT"),
+            "foundationgeo_root_fallback": env.get("FOUNDATIONGEO_ROOT"),
         },
         "model_weights": {
-            "egoallo_checkpoint_dir": env.get("EGOALLO_CHECKPOINT_DIR"),
-            "egoallo_model_config_path": env.get("EGOALLO_MODEL_CONFIG_PATH"),
-            "egoallo_model_npz": env.get("EGOALLO_MODEL_NPZ"),
+            "egogvae_checkpoint_path": env.get("EGOGVAE_CHECKPOINT_PATH"),
+            "egoallo_checkpoint_dir": str(
+                resolve_project_path(
+                    get_cfg(
+                        cfg,
+                        "model_weights.egoallo_checkpoint_dir",
+                        "third_party/egoallo/egoallo_checkpoint_april13/checkpoints_3000000",
+                    )
+                )
+            ),
             "geocalib_pinhole_tar": env.get("GEOCALIB_PINHOLE_TAR"),
             "mano_left_pkl": str(mano_left),
             "mano_right_pkl": str(mano_right),
             "smplh_npz_path": env.get("SMPLH_NPZ_PATH"),
             "vposer_dir": env.get("VPOSER_DIR"),
-            "moge_model_pt": env.get("MOGE_MODEL_PT"),
+            "foundationgeo_model_pt": env.get("FOUNDATIONGEO_MODEL_PT"),
         },
-        "moge_metric_scale": {
-            "enabled": bool(moge_enabled),
-            "output_dir": str(moge_output_dir) if moge_output_dir is not None else None,
-            "scale_json": str(moge_scale_json) if moge_scale_json is not None else None,
+        "foundationgeo_metric_scale": {
+            "enabled": bool(foundationgeo_enabled and not real_depth_scale_ok),
+            "output_dir": str(foundationgeo_output_dir) if foundationgeo_output_dir is not None else None,
+            "scale_json": str(foundationgeo_scale_json) if foundationgeo_scale_json is not None else None,
+        },
+        "real_sensor": {
+            "enabled": real_sensor_input is not None,
+            "input": str(real_sensor_input) if real_sensor_input is not None else None,
+            "has_imu": bool(real_sensor_has_imu),
+            "has_depth": bool(real_sensor_has_depth),
+            "rgb_camera_stream_id": real_sensor_rgb_stream_id,
+            "depth_camera_stream_id": real_sensor_depth_stream_id,
+            "imu_gravity": str(imu_gravity_txt) if real_sensor_has_imu else None,
+            "depth_scale_json": str(real_depth_scale_json) if real_sensor_has_depth else None,
+            "depth_scale_ok": bool(real_depth_scale_ok),
+            "depth_scale_reason": real_depth_scale_reason,
+            "imu_alignment": alignment_decision or None,
         },
         "metric_scale_result": metric_scale_result,
         "pose_validation": pose_validation_result,
         "pose_validation_report": str(pose_validation_report_json) if pose_validation_enabled else None,
-        "egoallo_inference_skipped": bool(egoallo_inference_skipped),
+        "egogvae_inference_skipped": bool(egogvae_inference_skipped),
+        "egogvae_motion_npz": str(egogvae_motion_npz),
         "final_smoothed_npz": str(final_smoothed_npz),
-        "motion_quality_report": str(motion_quality_report_json) if not egoallo_inference_skipped else None,
-        "egoallo_overlap": {
-            "target_segment_length": int(segment_length),
-            "context_frames": int(get_cfg(cfg, "egoallo.context_frames", 0)),
-            "save_only_center": bool(get_cfg(cfg, "egoallo.save_only_center", True)),
-        },
-        "jax_guidance": {
-            "compilation_cache_enabled": env.get("JAX_ENABLE_COMPILATION_CACHE") == "true",
-            "compilation_cache_dir": env.get("JAX_COMPILATION_CACHE_DIR"),
-            "min_compile_time_secs": env.get("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"),
-            "min_entry_size_bytes": env.get("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"),
-            "enable_xla_caches": env.get("JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES"),
+        "motion_quality_report": str(motion_quality_report_json) if not egogvae_inference_skipped else None,
+        "egoallo_refine_report": str(egoallo_refine_report_json)
+        if bool(egoallo_refine_result.get("enabled")) and not egogvae_inference_skipped
+        else None,
+        "egoallo_hawor_cache_npz": str(egoallo_hawor_cache_npz)
+        if bool(egoallo_refine_result.get("enabled")) and not egogvae_inference_skipped
+        else None,
+        "egoallo_refine": egoallo_refine_result,
+        "egogvae": {
+            "device": str(get_cfg(cfg, "egogvae.device", get_cfg(cfg, "runtime.device", "cuda"))),
+            "window_size": int(get_cfg(cfg, "egogvae.window_size", 128)),
+            "window_stride": int(get_cfg(cfg, "egogvae.window_stride", 32)),
+            "start_index": int(get_cfg(cfg, "egogvae.start_index", 0)),
+            "end_index": get_cfg(cfg, "egogvae.end_index", None),
+            "latent_mode": str(get_cfg(cfg, "egogvae.latent_mode", "mean")),
+            "python": py,
         },
         "inputs": {
+            "episode_dir": str(episode_dir),
+            "downstream_dir": str(downstream_dir),
             "frames_dir": str(frames_dir),
             "cam_space_dir": str(cam_space_dir),
             "hawor_hands_vggt_world": str(hawor_hands_vggt_world),
@@ -1211,22 +2257,36 @@ def main() -> None:
     #   1) convert_to_ego preprocessing
     #   2) GeoCalib / gravity alignment
     #   3) metric scale correction and front-end JSONL export
-    #   4) pose validation, which may write an empty final NPZ and skip EgoAllo
-    #   5) EgoAllo segment inference into ego_tmp_dir, if validation passed
-    #   6) 06_smooth_egoallo_segments.py merge-only stage, if smooth.enabled=true and EgoAllo ran
+    #   4) pose validation, which may write an empty final NPZ and skip EgoGVAE
+    #   5) EgoGVAE inference into egogvae_outputs_dir, if validation passed
     # If any previous subprocess raises an error, execution will stop before this block,
     # and all intermediate directories will be kept for debugging.
     cleanup_results: dict[str, Any] = {}
 
-    cleanup_results["egoallo_inputs"] = remove_dir_if_requested(
-        "egoallo_inputs",
-        egoallo_inputs_dir,
-        cleanup_flag(cfg, "egoallo_inputs", default=False),
+    cleanup_results["egogvae_inputs"] = remove_dir_if_requested(
+        "egogvae_inputs",
+        egogvae_inputs_dir,
+        cleanup_flag(cfg, "egogvae_inputs", default=False),
     )
-    cleanup_results["ego_tmp"] = remove_dir_if_requested(
-        "ego_tmp",
-        ego_tmp_dir,
-        cleanup_flag(cfg, "ego_tmp", default=False),
+    cleanup_results["egogvae_tmp"] = remove_dir_if_requested(
+        "egogvae_tmp",
+        egogvae_tmp_dir,
+        cleanup_flag(cfg, "egogvae_tmp", default=False),
+    )
+    cleanup_results["egoallo_outputs"] = remove_dir_if_requested(
+        "egoallo_outputs",
+        egogvae_outputs_dir,
+        cleanup_flag(cfg, "egoallo_outputs", default=False),
+    )
+    cleanup_results["assets_pointclouds"] = remove_dir_if_requested(
+        "assets_pointclouds",
+        _assets_pointclouds_dir(output_dir, cfg),
+        cleanup_flag(cfg, "assets_pointclouds", default=False),
+    )
+    cleanup_results["assets_poses"] = remove_dir_if_requested(
+        "assets_poses",
+        _assets_poses_dir(output_dir, cfg),
+        cleanup_flag(cfg, "assets_poses", default=False),
     )
 
     cleanup_tmp_enabled = cleanup_flag(

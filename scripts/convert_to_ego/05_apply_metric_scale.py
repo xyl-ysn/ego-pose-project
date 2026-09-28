@@ -501,6 +501,19 @@ def hand_confidence(hand: dict):
     return None
 
 
+def pick_world_hand_points(hand: dict, keys: tuple[str, ...]) -> tuple[np.ndarray | None, str | None]:
+    for key in keys:
+        if key not in hand:
+            continue
+        arr = np.asarray(hand[key], dtype=np.float64)
+        if arr.ndim == 3 and arr.shape[0] == 1 and arr.shape[2] == 3:
+            arr = arr[0]
+        if arr.ndim >= 2 and arr.shape[-1] == 3:
+            return arr, key
+        return None, key
+    return None, None
+
+
 def save_frontend_head_jsonl(head_trajectory_path: Path, output_path: Path, timestamps_path: Path | None) -> dict:
     poses = load_head_trajectory(head_trajectory_path).astype(np.float32)
     timestamp_rows = read_timestamps(timestamps_path)
@@ -525,6 +538,120 @@ def save_frontend_head_jsonl(head_trajectory_path: Path, output_path: Path, time
             }
             f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
     return {"output": str(output_path), "frames": int(len(poses))}
+
+
+def _rotation_to_quaternion_wxyz(R: np.ndarray) -> list[float]:
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+    tr = m00 + m11 + m22
+    if tr > 0.0:
+        s = np.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m21 - m12) / s
+        y = (m02 - m20) / s
+        z = (m10 - m01) / s
+    elif m00 > m11 and m00 > m22:
+        s = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    q = q / np.linalg.norm(q)
+    return q.tolist()
+
+
+def save_frontend_objects_parquet(
+    objects_parquet_in: Path,
+    output_path: Path,
+    R_final: np.ndarray,
+    t_floor: np.ndarray,
+    scale: float,
+    floor_z: float,
+) -> dict:
+    try:
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover - dependency diagnostic
+        raise RuntimeError("pandas/pyarrow is required to export objects parquet") from exc
+
+    table = pd.read_parquet(objects_parquet_in)
+    rows: list[dict[str, Any]] = []
+    anchor = np.array([0.0, 0.0, float(floor_z)], dtype=np.float64)
+
+    for _, row in table.iterrows():
+        frame_id = int(row["frame_id"])
+        common = {
+            "timestamp_ns": int(row["timestamp_ns"]),
+            "frame": frame_id,
+            "timestamp": float(row["timestamp_ns"]) / 1e9,
+            "src_frame_id": int(row["source_frame_idx"]),
+            "track_id": str(row.get("track_id") or ""),
+            "category": str(row.get("category") or ""),
+            "valid": bool(row.get("valid", False)),
+            "confidence": float(row.get("confidence") or 0.0),
+            "coordinate_system": "egoallo_world",
+            "length_unit": "meter",
+        }
+
+        matrix = row.get("T_world_from_object")
+        if matrix is None or not bool(row.get("valid", False)):
+            common.update({
+                "T_world_from_object": None,
+                "translation": None,
+                "quaternion_q_wxyz": None,
+            })
+        else:
+            T = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+            T_out = np.eye(4, dtype=np.float64)
+            T_out[:3, :3] = R_final @ T[:3, :3]
+            T_out[:3, 3] = R_final @ T[:3, 3] + t_floor
+            T_out[:3, 3] = anchor + float(scale) * (T_out[:3, 3] - anchor)
+            common.update({
+                "T_world_from_object": T_out.flatten().tolist(),
+                "translation": T_out[:3, 3].tolist(),
+                "quaternion_q_wxyz": _rotation_to_quaternion_wxyz(T_out[:3, :3]),
+            })
+        rows.append(common)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(output_path, index=False, engine="pyarrow")
+    return {
+        "input": str(objects_parquet_in),
+        "output": str(output_path),
+        "frames": int(len(rows)),
+        "valid_objects": int(sum(1 for r in rows if r["valid"])),
+    }
+
+
+def scale_object_mesh_glb(input_path: Path, output_path: Path, scale: float) -> dict:
+    try:
+        import trimesh
+    except Exception as exc:  # pragma: no cover - dependency diagnostic
+        raise RuntimeError("trimesh is required to process object GLB meshes") from exc
+
+    scene = trimesh.load(input_path, force="scene")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scene.export(str(output_path))
+    return {
+        "input": str(input_path),
+        "output": str(output_path),
+        "scale_applied": False,
+        "global_scale": float(scale),
+    }
 
 
 def save_frontend_hand_and_wrist_jsonl(
@@ -559,18 +686,26 @@ def save_frontend_hand_and_wrist_jsonl(
                     raise ValueError(
                         f"{hands_vggt_jsonl}:{line_no} hand {hand_idx}: side must be left/right, got {side!r}"
                     )
-                if "keypoints_3d" not in hand:
-                    raise KeyError(f"{hands_vggt_jsonl}:{line_no} hand {hand_idx}: missing keypoints_3d")
+                keypoints, keypoints_key = pick_world_hand_points(hand, ("keypoints_3d", "world_keypoints_3d"))
+                if keypoints is None:
+                    missing = "keypoints_3d/world_keypoints_3d" if keypoints_key is None else f"valid {keypoints_key}"
+                    raise KeyError(f"{hands_vggt_jsonl}:{line_no} hand {hand_idx}: missing {missing}")
 
                 keypoints_ego = transform_vggt_world_to_egoallo(
-                    np.asarray(hand["keypoints_3d"], dtype=np.float64),
+                    keypoints,
                     R_final,
                     t_floor,
                 )
-                keypoints_scaled = scale_world_points(keypoints_ego.reshape(-1, 3), scale, floor_z).reshape(
-                    keypoints_ego.shape
+                wrist_ego = keypoints_ego[0]
+                wrist_scaled = scale_world_points(
+                    wrist_ego.reshape(1, 3),
+                    scale,
+                    floor_z,
+                ).reshape(3)
+                keypoints_scaled = (
+                    wrist_scaled + (keypoints_ego - wrist_ego)
                 ).astype(np.float32)
-                wrist = keypoints_scaled[0].tolist()
+                wrist = wrist_scaled.astype(np.float32).tolist()
                 conf = hand_confidence(hand)
 
                 hand_out = {
@@ -580,14 +715,15 @@ def save_frontend_hand_and_wrist_jsonl(
                 }
                 if conf is not None:
                     hand_out["confidence"] = conf
-                if include_mesh and "mesh_vertices_3d" in hand:
+                mesh, _ = pick_world_hand_points(hand, ("mesh_vertices_3d", "world_mesh_vertices_3d"))
+                if include_mesh and mesh is not None:
                     mesh_ego = transform_vggt_world_to_egoallo(
-                        np.asarray(hand["mesh_vertices_3d"], dtype=np.float64),
+                        mesh,
                         R_final,
                         t_floor,
                     )
-                    mesh_scaled = scale_world_points(mesh_ego.reshape(-1, 3), scale, floor_z).reshape(
-                        mesh_ego.shape
+                    mesh_scaled = (
+                        wrist_scaled + (mesh_ego - wrist_ego)
                     ).astype(np.float32)
                     hand_out["mesh_vertices_3d"] = mesh_scaled.tolist()
 
@@ -612,7 +748,53 @@ def save_frontend_hand_and_wrist_jsonl(
     }
 
 
-def scale_hamer_pkl(input_path: Path, output_path: Path, scale: float) -> dict:
+def reject_distant_hamer_hands(data: dict, max_wrist_distance_m: float) -> dict:
+    if not np.isfinite(max_wrist_distance_m) or max_wrist_distance_m <= 0:
+        raise ValueError("max_wrist_distance_m must be finite and positive")
+    report = {"max_wrist_distance_m": float(max_wrist_distance_m)}
+    for side in ("left", "right"):
+        counts = dict(input=0, kept=0, rejected_far=0, rejected_invalid=0)
+        detections = data[f"detections_{side}_wrt_cam"]
+        for timestamp, det in detections.items():
+            if det is None:
+                continue
+            points = np.asarray(det["keypoints_3d"])
+            if points.ndim != 3 or points.shape[1:] != (21, 3):
+                raise ValueError(f"Invalid {side} keypoints shape at {timestamp}: {points.shape}")
+            distance = np.linalg.norm(points[:, 0], axis=1)
+            valid = np.isfinite(points).all(axis=(1, 2)) & (points[:, 0, 2] > 0)
+            keep = valid & (distance <= max_wrist_distance_m)
+            counts["input"] += len(points)
+            counts["kept"] += int(keep.sum())
+            counts["rejected_far"] += int((valid & ~keep).sum())
+            counts["rejected_invalid"] += int((~valid).sum())
+            if not keep.any():
+                # Retain timestamp slots; absence is not a zero-weight observation.
+                detections[timestamp] = None
+            elif not keep.all():
+                detections[timestamp] = {
+                    field: value[keep] if isinstance(value, np.ndarray)
+                    and value.ndim > 0 and value.shape[0] == len(points) else value
+                    for field, value in det.items()
+                }
+        report[side] = counts
+    return report
+
+
+def scale_hamer_pkl(
+    input_path: Path,
+    output_path: Path,
+    scale: float,
+    max_wrist_distance_m: float = 0.0,
+    hand_geometry_scale: float | None = None,
+) -> dict:
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Hand metric scale must be finite and positive")
+    if not np.isfinite(max_wrist_distance_m) or max_wrist_distance_m < 0:
+        raise ValueError("max_wrist_distance_m must be finite and nonnegative")
+    geometry_scale = float(scale if hand_geometry_scale is None else hand_geometry_scale)
+    if not np.isfinite(geometry_scale) or geometry_scale <= 0:
+        raise ValueError("hand_geometry_scale must be finite and positive")
     with open(input_path, "rb") as f:
         data = pickle.load(f)
 
@@ -622,10 +804,25 @@ def scale_hamer_pkl(input_path: Path, output_path: Path, scale: float) -> dict:
         for det in detections.values():
             if det is None:
                 continue
+            keypoints = np.asarray(det["keypoints_3d"], dtype=np.float32)
+            if keypoints.ndim != 3 or keypoints.shape[2] != 3:
+                raise ValueError(f"Invalid keypoints_3d shape: {keypoints.shape}")
+            wrist = keypoints[:, 0, :]
+            target_wrist = wrist * float(scale)
             for field in ("verts", "keypoints_3d"):
                 if field in det and det[field] is not None:
-                    det[field] = np.asarray(det[field], dtype=np.float32) * float(scale)
+                    points = np.asarray(det[field], dtype=np.float32)
+                    if points.ndim != 3 or points.shape[0] != len(wrist) or points.shape[2] != 3:
+                        raise ValueError(f"Invalid {field} shape: {points.shape}")
+                    det[field] = (
+                        target_wrist[:, None, :]
+                        + geometry_scale * (points - wrist[:, None, :])
+                    ).astype(np.float32)
             scaled_detections += 1
+
+    distance_filter = {"enabled": max_wrist_distance_m > 0}
+    if distance_filter["enabled"]:
+        distance_filter.update(reject_distant_hamer_hands(data, max_wrist_distance_m))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
@@ -634,7 +831,10 @@ def scale_hamer_pkl(input_path: Path, output_path: Path, scale: float) -> dict:
     return {
         "input": str(input_path),
         "output": str(output_path),
+        "scene_translation_scale": float(scale),
+        "hand_geometry_scale": geometry_scale,
         "scaled_detections": int(scaled_detections),
+        "distance_filter": distance_filter,
     }
 
 
@@ -678,34 +878,7 @@ DEFAULT_HAND_SCALE_BONES = [
 ]
 
 
-def parse_scale_priority(value: str | list | tuple | None) -> list[str]:
-    if value is None:
-        items = ["hands", "moge", "height", "none"]
-    elif isinstance(value, (list, tuple)):
-        items = [str(x) for x in value]
-    else:
-        items = str(value).split(",")
-    out = []
-    for item in items:
-        name = str(item).strip().lower()
-        if not name:
-            continue
-        aliases = {
-            "hand": "hands",
-            "hand_fallback": "hands",
-            "moge_scale": "moge",
-            "moge_metric": "moge",
-            "noscale": "none",
-            "no_scale": "none",
-            "skip": "none",
-            "head": "height",
-            "head_height": "height",
-        }
-        out.append(aliases.get(name, name))
-    return out or ["hands", "moge", "height", "none"]
-
-
-def cap_hand_scale_by_head_p90(
+def cap_scale_by_head_p90(
     scale: float,
     info: dict,
     head_poses: np.ndarray,
@@ -718,11 +891,12 @@ def cap_hand_scale_by_head_p90(
     info["capped_by_head_p90"] = False
     info["scale_before_head_p90_cap"] = float(scale)
 
-    if max_p90_head_height is None:
+    if max_p90_head_height is None or float(max_p90_head_height) <= 0.0:
+        info["head_height_sanity_policy"] = "disabled"
         return float(scale), info
 
     max_p90 = float(max_p90_head_height)
-    if not np.isfinite(max_p90) or max_p90 <= 0:
+    if not np.isfinite(max_p90):
         info["head_p90_cap_warning"] = "invalid_max_p90_head_height"
         return float(scale), info
 
@@ -747,64 +921,9 @@ def cap_hand_scale_by_head_p90(
     info.update({
         "scale": float(capped_scale),
         "head_p90_cap_warning": (
-            f"hand-fallback head cap applied: "
+            f"head p90 cap applied: "
             f"scaled p90 head height {scaled_p90:.6f}m exceeds {max_p90:.6f}m, "
             f"scale changed {float(scale):.9f} -> {float(capped_scale):.9f}."
-        ),
-    })
-    return float(capped_scale), info
-
-
-def cap_moge_scale_by_head_stat(
-    scale: float,
-    info: dict,
-    head_poses: np.ndarray,
-    floor_z: float,
-    args: argparse.Namespace,
-) -> tuple[float, dict]:
-    info = dict(info)
-    info["head_height_sanity_policy"] = "cap_high_stat_only"
-    info["max_valid_head_height"] = float(args.scale_sanity_max_valid_head_height)
-    info["capped_by_head_height_stat"] = False
-    info["scale_before_head_height_cap"] = float(scale)
-
-    if not bool(args.scale_sanity_enabled):
-        return float(scale), info
-
-    heights = _finite_head_heights(head_poses, floor_z)
-    if heights.size == 0:
-        info["head_height_cap_warning"] = "no_finite_head_heights"
-        return float(scale), info
-
-    original_stat, stat_name = _stat_value(
-        heights,
-        args.scale_sanity_statistic,
-        args.scale_sanity_percentile,
-    )
-    info["original_head_height_stat_for_cap"] = original_stat
-    info["head_height_cap_statistic"] = stat_name
-    if original_stat is None or not np.isfinite(original_stat) or float(original_stat) <= 1e-8:
-        info["head_height_cap_warning"] = "invalid_original_head_height_stat"
-        return float(scale), info
-
-    max_h = float(args.scale_sanity_max_valid_head_height)
-    if not np.isfinite(max_h) or max_h <= 0:
-        info["head_height_cap_warning"] = "invalid_max_valid_head_height"
-        return float(scale), info
-
-    scaled_stat = float(original_stat) * float(scale)
-    info["scaled_head_height_stat_before_cap"] = scaled_stat
-    if scaled_stat <= max_h:
-        return float(scale), info
-
-    capped_scale = max_h / float(original_stat)
-    info.update({
-        "scale": float(capped_scale),
-        "capped_by_head_height_stat": True,
-        "scaled_head_height_stat_after_cap": float(max_h),
-        "head_height_cap_warning": (
-            f"MoGe scale capped from {float(scale):.9f} to {float(capped_scale):.9f} "
-            f"because scaled {stat_name} head height {scaled_stat:.6f}m exceeds {max_h:.6f}m"
         ),
     })
     return float(capped_scale), info
@@ -1054,22 +1173,6 @@ def _safe_percentile(values: np.ndarray, q: float) -> float | None:
     return float(np.percentile(values, float(q)))
 
 
-def _stat_value(values: np.ndarray, statistic: str, percentile: float) -> tuple[float | None, str]:
-    values = np.asarray(values, dtype=np.float64)
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return None, "empty"
-    stat = str(statistic or "percentile").strip().lower()
-    if stat in {"median", "p50"}:
-        return float(np.median(values)), "median"
-    if stat in {"mean", "avg", "average"}:
-        return float(np.mean(values)), "mean"
-    if stat in {"max", "maximum"}:
-        return float(np.max(values)), "max"
-    # Default: percentile, e.g. p90/p95, used as a proxy for near-standing head height.
-    return float(np.percentile(values, float(percentile))), f"p{float(percentile):g}"
-
-
 def height_diagnostics(head_poses: np.ndarray, floor_z: float, scale: float) -> dict:
     heights = _finite_head_heights(head_poses, floor_z)
     if heights.size == 0:
@@ -1116,120 +1219,45 @@ def height_diagnostics(head_poses: np.ndarray, floor_z: float, scale: float) -> 
     }
 
 
-def validate_candidate_scale(
-    *,
-    source: str,
-    scale: float,
-    head_poses: np.ndarray,
-    floor_z: float,
-    args: argparse.Namespace,
-) -> tuple[bool, dict]:
-    """Post-check a candidate scale using scaled head-height plausibility.
-
-    This is intentionally a broad sanity check, not a strict body-height target.
-    It rejects obviously bad MoGe/hand scales, e.g. scales that make the p90 head
-    height 0.3 m or 3.5 m. It should not reject normal bending/crouching videos.
-    """
-    info = {
-        "source": str(source),
-        "enabled": bool(args.scale_sanity_enabled),
-        "scale": float(scale) if np.isfinite(scale) else None,
-        "status": "ok",
-    }
-
-    if not np.isfinite(scale) or float(scale) <= 0.0:
-        info.update({"status": "rejected", "reason": "invalid_scale"})
-        return False, info
-
-    if not bool(args.scale_sanity_enabled):
-        info.update({"reason": "disabled"})
-        return True, info
-
-    heights = _finite_head_heights(head_poses, floor_z)
-    if heights.size == 0:
-        info.update({"status": "rejected", "reason": "no_finite_head_heights"})
-        return False, info
-
-    scaled = heights * float(scale)
-    stat_value, stat_name = _stat_value(
-        scaled,
-        args.scale_sanity_statistic,
-        args.scale_sanity_percentile,
-    )
-    min_h = float(args.scale_sanity_min_valid_head_height)
-    max_h = float(args.scale_sanity_max_valid_head_height)
-    info.update({
-        "reason": "scaled_head_height_sanity",
-        "statistic": stat_name,
-        "scaled_head_height_stat": stat_value,
-        "min_valid_head_height": min_h,
-        "max_valid_head_height": max_h,
-        "scaled_height_min": float(np.min(scaled)),
-        "scaled_height_median": float(np.median(scaled)),
-        "scaled_height_p90": _safe_percentile(scaled, 90),
-        "scaled_height_p95": _safe_percentile(scaled, 95),
-        "scaled_height_max": float(np.max(scaled)),
-    })
-
-    if stat_value is None or not np.isfinite(stat_value):
-        info.update({"status": "rejected", "reason": "invalid_scaled_head_height_stat"})
-        return False, info
-
-    if stat_value < min_h or stat_value > max_h:
-        reject = True
-        if source == "moge" and not bool(args.scale_sanity_reject_moge_if_invalid_height):
-            reject = False
-        if source == "hands" and not bool(args.scale_sanity_reject_hands_if_invalid_height):
-            reject = False
-        info.update({
-            "status": "rejected" if reject else "warning",
-            "reason": "scaled_head_height_out_of_range",
-            "warning": (
-                f"{source} scale makes {stat_name} head height {stat_value:.6f}m, "
-                f"outside [{min_h:.6f}, {max_h:.6f}]m."
-            ),
-        })
-        return (not reject), info
-
-    return True, info
-
-
-def try_moge_scale(path: Path | None) -> tuple[float | None, dict]:
+def try_depth_scale(path: Path | None) -> tuple[float | None, dict]:
     info: dict = {
-        "source": "moge",
+        "source": "scale_json",
         "status": "failed",
         "scale": None,
     }
     if path is None:
-        info["reason"] = "moge_scale_json_not_provided"
+        info["reason"] = "scale_json_not_provided"
         return None, info
     path = path.expanduser().resolve()
     info["path"] = str(path)
     if not path.is_file():
-        info["reason"] = "moge_scale_json_not_found"
+        info["reason"] = "scale_json_not_found"
         return None, info
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
+        source = str(data.get("source") or "metric_depth")
+        info["source"] = source
         info["raw"] = {
             "path": str(path),
             "status": data.get("status"),
             "scale": data.get("scale"),
+            "source": source,
         }
-        status = str(data.get("status", "")).lower()
-        scale = data.get("scale", None)
-        if scale is None and isinstance(data.get("scale_info"), dict):
-            scale = data["scale_info"].get("scale")
-        scale = float(scale)
-        if status not in {"ok", "success", "completed", "valid"}:
-            info["reason"] = f"moge_status_{status or 'missing'}"
+        status = data.get("status")
+        if status != "ok":
+            info["reason"] = f"scale_json_status_{status or 'missing'}"
             return None, info
+        if "scale" not in data:
+            info["reason"] = "scale_json_scale_missing"
+            return None, info
+        scale = float(data["scale"])
         if not np.isfinite(scale) or scale <= 0.0:
-            info["reason"] = "invalid_moge_scale"
+            info["reason"] = "invalid_scale_json_scale"
             return None, info
         info.update({
             "status": "ok",
-            "reason": data.get("reason", "moge_depth_scene_ratio"),
+            "reason": data.get("reason", "metric_depth_floor_scale"),
             "scale": float(scale),
             "num_valid_frames": data.get("num_valid_frames"),
             "relative_mad": data.get("relative_mad"),
@@ -1416,279 +1444,75 @@ def try_hand_scale(
         return None, info
 
 
-def _moving_average_1d(values: np.ndarray, window: int) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    window = int(window)
-    if window <= 1 or values.size == 0:
-        return values
-    if window % 2 == 0:
-        window += 1
-    pad = window // 2
-    padded = np.pad(values, (pad, pad), mode="edge")
-    out = np.empty_like(values)
-    for i in range(values.size):
-        out[i] = np.mean(padded[i:i + window])
-    return out
-
-
-def try_height_scale(args: argparse.Namespace, head_poses: np.ndarray) -> tuple[float | None, dict]:
-    """Estimate metric scale from a likely-standing head-height statistic.
-
-    This is the third fallback after MoGe and hand bones. It no longer uses the
-    full-sequence median by default, because videos can start bent/crouched and
-    later become upright. Instead, it uses a high percentile, usually p90, of
-    valid head heights as a proxy for standing head height.
-    """
-    heights_all = _finite_head_heights(head_poses, args.floor_z)
-    info: dict = {
-        "source": "height",
-        "status": "failed",
-        "scale": None,
-        "floor_z": float(args.floor_z),
-        "mode": str(args.height_fallback_mode),
-        "statistic": str(args.height_fallback_statistic),
-        "percentile": float(args.height_fallback_percentile),
-        "target_height": None,
-        "num_frames": int(heights_all.size),
-        "min_valid_height": float(args.height_fallback_min_valid_height),
-        "max_valid_height": float(args.height_fallback_max_valid_height),
-        "min_candidate_frames": int(args.height_fallback_min_candidate_frames),
-        "min_scale": float(args.height_fallback_min_scale),
-        "max_scale": float(args.height_fallback_max_scale),
-    }
-
-    if not bool(args.height_fallback_enabled):
-        info["reason"] = "disabled"
-        return None, info
-
-    if heights_all.size == 0:
-        info["reason"] = "no_finite_head_heights"
-        return None, info
-
-    # Optional smoothing only for selecting the standing-height statistic. The
-    # original unsmoothed heights are still reported in diagnostics.
-    smooth_window = int(args.height_fallback_smooth_window)
-    heights_for_select = _moving_average_1d(heights_all, smooth_window)
-
-    min_valid = float(args.height_fallback_min_valid_height)
-    max_valid = float(args.height_fallback_max_valid_height)
-    valid = heights_for_select[np.isfinite(heights_for_select)]
-    valid = valid[(valid > min_valid) & (valid < max_valid)]
-
-    info.update({
-        "original_height_min": float(np.min(heights_all)),
-        "original_height_median": float(np.median(heights_all)),
-        "original_height_mean": float(np.mean(heights_all)),
-        "original_height_max": float(np.max(heights_all)),
-        "original_height_p75": _safe_percentile(heights_all, 75),
-        "original_height_p90": _safe_percentile(heights_all, 90),
-        "original_height_p95": _safe_percentile(heights_all, 95),
-        "num_candidate_frames": int(valid.size),
-        "smooth_window": smooth_window,
-    })
-
-    if valid.size < int(args.height_fallback_min_candidate_frames):
-        info["reason"] = "not_enough_standing_height_candidates"
-        return None, info
-
-    height_value, stat_name = _stat_value(
-        valid,
-        args.height_fallback_statistic,
-        args.height_fallback_percentile,
-    )
-    if height_value is None or not np.isfinite(height_value) or height_value <= 1e-8:
-        info["reason"] = "invalid_standing_head_height"
-        info["standing_head_height"] = height_value
-        return None, info
-
-    target_height = args.height_fallback_target_height
-    if target_height is None:
-        info.update({"reason": "missing_height_fallback_target_height", "target_height": None})
-        return None, info
-    target_height = float(target_height)
-
-    if not np.isfinite(target_height) or target_height <= 0:
-        info.update({"reason": "invalid_target_height", "target_height": target_height})
-        return None, info
-
-    scale = target_height / float(height_value)
-    if not np.isfinite(scale) or scale <= 0:
-        info.update({"reason": "invalid_height_scale", "scale": scale})
-        return None, info
-    if scale < float(args.height_fallback_min_scale) or scale > float(args.height_fallback_max_scale):
-        info.update({
-            "reason": "height_scale_out_of_range",
-            "scale": float(scale),
-            "standing_head_height": float(height_value),
-            "target_height": target_height,
-        })
-        return None, info
-
-    diag = height_diagnostics(head_poses, args.floor_z, scale)
-    info.update(diag)
-    info.update({
-        "status": "ok",
-        "reason": "standing_head_height",
-        "scale_method": "standing_head_height_percentile" if stat_name.startswith("p") else f"standing_head_height_{stat_name}",
-        "scale": float(scale),
-        "standing_head_height": float(height_value),
-        "standing_height_statistic": stat_name,
-        "target_height": target_height,
-    })
-    return float(scale), info
-
-
-def _candidate_rejection_log(source: str, scale: float, sanity: dict, next_source: str | None) -> str:
-    stat_name = sanity.get("statistic", "head_height_stat")
-    stat_value = sanity.get("scaled_head_height_stat")
-    min_h = sanity.get("min_valid_head_height")
-    max_h = sanity.get("max_valid_head_height")
-    fallback = f" Fallback to {next_source}." if next_source else ""
-    if stat_value is None:
-        return f"Reject {source} scale={scale:.9f}: {sanity.get('reason')}.{fallback}"
-    return (
-        f"Reject {source} scale={scale:.9f}: scaled {stat_name} head height="
-        f"{float(stat_value):.6f}m is outside [{float(min_h):.6f}, {float(max_h):.6f}]m."
-        f"{fallback}"
-    )
-
-
-def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -> tuple[float, dict]:
-    priority = parse_scale_priority(args.scale_priority)
+def decide_metric_scale(args: argparse.Namespace, head_poses: np.ndarray) -> tuple[float, dict]:
     attempts: list[dict] = []
+    candidates: list[tuple[str, float, dict]] = []
 
-    def next_source_after(i: int) -> str | None:
-        for nxt in priority[i + 1:]:
-            if nxt != "none":
-                return nxt
-        return "none" if "none" in priority[i + 1:] else None
+    depth_scale, depth_info = try_depth_scale(args.depth_scale_json)
+    attempts.append(depth_info)
+    if depth_scale is not None:
+        source = str(depth_info.get("source") or "metric_depth")
+        candidates.append((source, float(depth_scale), depth_info))
 
-    for idx, source in enumerate(priority):
-        if source == "moge":
-            scale, info = try_moge_scale(args.moge_scale_json)
-            if scale is None:
-                attempts.append(info)
-                continue
+    if bool(args.hand_scale_enabled):
+        hand_scale, hand_info = try_hand_scale(
+            hands_jsonl=args.hands_vggt_jsonl_for_scale or args.hands_vggt_jsonl_in,
+            r_align=args.r_align_for_scale or args.r_align,
+            align_meta=args.align_meta_for_scale or args.align_meta,
+            bones_json=args.hand_scale_bones_json,
+            min_valid_bones=args.hand_scale_min_valid_bones,
+            max_relative_mad=args.hand_scale_max_relative_mad,
+            min_scale=args.hand_scale_min_scale,
+            max_scale=args.hand_scale_max_scale,
+        )
+    else:
+        hand_scale = None
+        hand_info = {"source": "hands", "status": "failed", "reason": "disabled", "scale": None}
+    attempts.append(hand_info)
+    if hand_scale is not None:
+        candidates.append(("hands", float(hand_scale), hand_info))
 
-            scale, info = cap_moge_scale_by_head_stat(
-                scale,
-                info,
-                head_poses,
-                args.floor_z,
-                args,
-            )
+    if candidates:
+        selected_source, raw_scale, selected_info = max(candidates, key=lambda x: x[1])
+        selected_info = dict(selected_info)
+        selected_source = str(selected_info.get("source") or selected_source)
+        selected_info["selected_before_head_p90_cap"] = True
+        selected_info["raw_selected_scale"] = float(raw_scale)
+        scale, selected_info = cap_scale_by_head_p90(
+            raw_scale,
+            selected_info,
+            head_poses,
+            args.floor_z,
+            args.max_p90_head_height,
+        )
+        for i, attempt in enumerate(attempts):
+            if attempt.get("source") == selected_source:
+                attempts[i] = selected_info
+                break
+        if selected_source == depth_info.get("source"):
+            depth_info = selected_info
+        elif selected_source == "hands":
+            hand_info = selected_info
 
-            ok, sanity = validate_candidate_scale(
-                source="moge",
-                scale=scale,
-                head_poses=head_poses,
-                floor_z=args.floor_z,
-                args=args,
-            )
-            info["sanity"] = sanity
-            if not ok:
-                info.update({
-                    "status": "rejected",
-                    "reject_reason": sanity.get("reason"),
-                    "reason": sanity.get("reason", info.get("reason")),
-                })
-                attempts.append(info)
-                print(f"[Warning] {_candidate_rejection_log('MoGe', float(scale), sanity, next_source_after(idx))}", flush=True)
-                continue
-
-            attempts.append(info)
-            diag = height_diagnostics(head_poses, args.floor_z, scale)
-            diag.update({
-                "reason": "moge",
-                "selected_source": "moge",
-                "scale_method": "moge_depth_scene_ratio",
-                "priority": priority,
-                "attempts": attempts,
-                "moge": info,
-                "sanity": sanity,
-                "target_height": None if not info.get("capped_by_head_height_stat") else float(args.scale_sanity_max_valid_head_height),
-                "warning": info.get("head_height_cap_warning") or sanity.get("warning"),
-            })
-            if info.get("head_height_cap_warning"):
-                print(f"[Warning] {info.get('head_height_cap_warning')}", flush=True)
-            return float(scale), diag
-
-        elif source == "hands":
-            if not bool(args.hand_scale_enabled):
-                info = {"source": "hands", "status": "failed", "reason": "disabled", "scale": None}
-                attempts.append(info)
-                continue
-            scale, info = try_hand_scale(
-                hands_jsonl=args.hands_vggt_jsonl_for_scale or args.hands_vggt_jsonl_in,
-                r_align=args.r_align_for_scale or args.r_align,
-                align_meta=args.align_meta_for_scale or args.align_meta,
-                bones_json=args.hand_scale_bones_json,
-                min_valid_bones=args.hand_scale_min_valid_bones,
-                max_relative_mad=args.hand_scale_max_relative_mad,
-                min_scale=args.hand_scale_min_scale,
-                max_scale=args.hand_scale_max_scale,
-            )
-            if scale is None:
-                attempts.append(info)
-                continue
-
-            scale, info = cap_hand_scale_by_head_p90(
-                scale,
-                info,
-                head_poses,
-                args.floor_z,
-                args.hand_max_p90_head_height,
-            )
-
-            attempts.append(info)
-            diag = height_diagnostics(head_poses, args.floor_z, scale)
-            diag.update({
-                "reason": "hands",
-                "selected_source": "hands",
-                "scale_method": "hand_bone_length_ratio",
-                "priority": priority,
-                "attempts": attempts,
-                "hands": info,
-                "hand_head_height_policy": "trust_hands_cap_high_p90",
-                "target_height": None,
-                "warning": info.get("head_p90_cap_warning"),
-            })
-            if info.get("head_p90_cap_warning"):
-                print(f"[Warning] {info.get('head_p90_cap_warning')}", flush=True)
-            return float(scale), diag
-
-        elif source == "height":
-            scale, info = try_height_scale(args, head_poses)
-            attempts.append(info)
-            if scale is not None:
-                info.update({
-                    "selected_source": "height",
-                    "scale_method": info.get("scale_method", "standing_head_height"),
-                    "priority": priority,
-                    "attempts": attempts,
-                    "warning": None,
-                })
-                return float(scale), info
-
-        elif source == "none":
-            scale = 1.0
-            info = {"source": "none", "status": "ok", "reason": "no_scale", "scale": 1.0}
-            attempts.append(info)
-            diag = height_diagnostics(head_poses, args.floor_z, scale)
-            diag.update({
-                "reason": "none",
-                "selected_source": "none",
-                "scale_method": "no_scale_warning",
-                "priority": priority,
-                "attempts": attempts,
-                "target_height": None,
-                "warning": "No valid metric scale source; continue with scale=1.0.",
-            })
-            print(f"[Warning] {diag['warning']}", flush=True)
-            return scale, diag
-
-        else:
-            attempts.append({"source": source, "status": "failed", "reason": "unknown_source", "scale": None})
+        diag = height_diagnostics(head_poses, args.floor_z, scale)
+        diag.update({
+            "reason": "metric_depth_hands_max",
+            "selected_source": selected_source,
+            "scale_method": "max_metric_depth_hands_then_p90_cap",
+            "attempts": attempts,
+            "depth": depth_info,
+            "hands": hand_info,
+            "candidate_scales": [
+                {"source": source, "scale": float(scale_value)}
+                for source, scale_value, _info in candidates
+            ],
+            "raw_selected_scale": float(raw_scale),
+            "max_p90_head_height": float(args.max_p90_head_height),
+            "warning": selected_info.get("head_p90_cap_warning"),
+        })
+        if selected_info.get("head_p90_cap_warning"):
+            print(f"[Warning] {selected_info.get('head_p90_cap_warning')}", flush=True)
+        return float(scale), diag
 
     scale = 1.0
     diag = height_diagnostics(head_poses, args.floor_z, scale)
@@ -1696,10 +1520,8 @@ def decide_scale_by_priority(args: argparse.Namespace, head_poses: np.ndarray) -
         "reason": "none",
         "selected_source": "none",
         "scale_method": "no_scale_warning",
-        "priority": priority,
         "attempts": attempts,
-        "target_height": None,
-        "warning": "Scale priority exhausted; continue with scale=1.0.",
+        "warning": "Metric depth and hand scale both failed; continue with scale=1.0.",
     })
     print(f"[Warning] {diag['warning']}", flush=True)
     return scale, diag
@@ -1738,6 +1560,10 @@ def main() -> None:
     parser.add_argument("--point-cloud-out", required=True, type=Path)
     parser.add_argument("--hamer-pkl-out", required=True, type=Path)
     parser.add_argument(
+        "--hand-max-camera-distance-m", type=float, default=0.0,
+        help="Reject camera-to-wrist distances above this after metric scaling; 0 disables.",
+    )
+    parser.add_argument(
         "--metadata-out",
         required=True,
         type=Path,
@@ -1746,39 +1572,19 @@ def main() -> None:
 
     # Metric-scale parameters. These are normally read from YAML by run_body_mesh.py.
     parser.add_argument("--floor-z", type=float, default=0.0)
-    parser.add_argument(
-        "--scale-priority",
-        default="hands,moge,height,none",
-        help="Comma-separated scale priority. Supported sources: moge,hands,height,none.",
-    )
-    parser.add_argument("--moge-scale-json", type=Path, default=None)
+    parser.add_argument("--depth-scale-json", type=Path, default=None)
     parser.add_argument("--hand-scale-enabled", type=int, default=1)
     parser.add_argument("--hand-scale-bones-json", type=Path, default=None)
     parser.add_argument("--hand-scale-min-valid-bones", type=int, default=20)
     parser.add_argument("--hand-scale-max-relative-mad", type=float, default=0.35)
     parser.add_argument("--hand-scale-min-scale", type=float, default=0.05)
     parser.add_argument("--hand-scale-max-scale", type=float, default=20.0)
-    parser.add_argument("--hand-max-p90-head-height", type=float, default=1.70)
-
-    parser.add_argument("--scale-sanity-enabled", type=int, default=1)
-    parser.add_argument("--scale-sanity-statistic", default="percentile")
-    parser.add_argument("--scale-sanity-percentile", type=float, default=90.0)
-    parser.add_argument("--scale-sanity-min-valid-head-height", type=float, default=0.8)
-    parser.add_argument("--scale-sanity-max-valid-head-height", type=float, default=2.4)
-    parser.add_argument("--scale-sanity-reject-moge-if-invalid-height", type=int, default=1)
-    parser.add_argument("--scale-sanity-reject-hands-if-invalid-height", type=int, default=1)
-
-    parser.add_argument("--height-fallback-enabled", type=int, default=1)
-    parser.add_argument("--height-fallback-mode", default="standing_head_height")
-    parser.add_argument("--height-fallback-statistic", default="percentile")
-    parser.add_argument("--height-fallback-percentile", type=float, default=90.0)
-    parser.add_argument("--height-fallback-target-height", type=float, default=None)
-    parser.add_argument("--height-fallback-min-valid-height", type=float, default=1.0)
-    parser.add_argument("--height-fallback-max-valid-height", type=float, default=2.3)
-    parser.add_argument("--height-fallback-min-candidate-frames", type=int, default=10)
-    parser.add_argument("--height-fallback-min-scale", type=float, default=0.05)
-    parser.add_argument("--height-fallback-max-scale", type=float, default=20.0)
-    parser.add_argument("--height-fallback-smooth-window", type=int, default=1)
+    parser.add_argument(
+        "--max-p90-head-height",
+        type=float,
+        default=1.60,
+        help="Cap the selected scale so p90 head height does not exceed this value; 0 disables.",
+    )
 
     parser.add_argument("--hands-vggt-jsonl-for-scale", type=Path, default=None)
     parser.add_argument("--R-align-for-scale", dest="r_align_for_scale", type=Path, default=None)
@@ -1791,7 +1597,7 @@ def main() -> None:
         "--frontend-output-dir",
         type=Path,
         default=None,
-        help="Directory to write front-end JSONL files. Pipeline uses <output_dir>/egoallo_outputs.",
+        help="Directory to write front-end JSONL files. Pipeline uses <output_dir>/egogvae_outputs.",
     )
     parser.add_argument(
         "--frontend-head-jsonl-name",
@@ -1807,7 +1613,7 @@ def main() -> None:
         "--timestamps-txt",
         type=Path,
         default=None,
-        help="timestamps.txt for front-end JSONL metadata. Pipeline uses <output_dir>/egoallo_inputs/timestamps.txt.",
+        help="timestamps.txt for front-end JSONL metadata. Pipeline uses <output_dir>/egogvae_inputs/timestamps.txt.",
     )
     parser.add_argument(
         "--hands-vggt-jsonl-in",
@@ -1833,6 +1639,10 @@ def main() -> None:
         action="store_true",
         help="Also export scaled mesh_vertices_3d in hand_keypoints_egoallo.jsonl. This can be very large.",
     )
+    parser.add_argument("--objects-parquet-in", type=Path, default=None)
+    parser.add_argument("--objects-parquet-out", type=Path, default=None)
+    parser.add_argument("--object-mesh-in", type=Path, action="append", default=None)
+    parser.add_argument("--object-mesh-out", type=Path, action="append", default=None)
     parser.add_argument(
         "--probe-scale-only",
         action="store_true",
@@ -1843,7 +1653,7 @@ def main() -> None:
     args = parser.parse_args()
 
     head_poses = load_head_trajectory(args.head_trajectory_in)
-    scale, scale_info = decide_scale_by_priority(args, head_poses)
+    scale, scale_info = decide_metric_scale(args, head_poses)
 
     metadata = {
         "scale_info": scale_info,
@@ -1862,8 +1672,7 @@ def main() -> None:
             "point_cloud_r_align": str(args.point_cloud_r_align) if args.point_cloud_r_align is not None else None,
             "point_cloud_align_meta": str(args.point_cloud_align_meta) if args.point_cloud_align_meta is not None else None,
             "final_scene_output_voxel_size": float(args.final_scene_output_voxel_size),
-            "scale_priority": str(args.scale_priority),
-            "moge_scale_json": str(args.moge_scale_json) if args.moge_scale_json is not None else None,
+            "depth_scale_json": str(args.depth_scale_json) if args.depth_scale_json is not None else None,
             "hand_scale_bones_json": str(args.hand_scale_bones_json) if args.hand_scale_bones_json is not None else None,
             "hands_vggt_jsonl_for_scale": str(args.hands_vggt_jsonl_for_scale) if args.hands_vggt_jsonl_for_scale is not None else None,
             "R_align_for_scale": str(args.r_align_for_scale) if args.r_align_for_scale is not None else None,
@@ -1887,7 +1696,6 @@ def main() -> None:
     print(f"selected scale method: {scale_info.get('scale_method', scale_info.get('reason'))}")
     if scale_info.get("warning"):
         print(f"[Warning] {scale_info.get('warning')}")
-    print(f"scale priority: {scale_info.get('priority')}")
     print(f"scale: {scale:.9f}")
     scaled_med = scale_info.get("scaled_height_median")
     scaled_p90 = scale_info.get("scaled_height_p90")
@@ -1931,11 +1739,24 @@ def main() -> None:
     )
     print(f"Saved scaled point cloud: {args.point_cloud_out}")
 
+    hand_distance_limit = args.hand_max_camera_distance_m
+    if scale_info.get("selected_source") == "none" and hand_distance_limit > 0:
+        print("[Hand filter] metric distance skipped: no valid metric scale", flush=True)
+        hand_distance_limit = 0.0
+    hand_geometry_scale = scale
+    hand_scale_info = scale_info.get("hands")
+    if isinstance(hand_scale_info, dict) and hand_scale_info.get("status") == "ok":
+        candidate = hand_scale_info.get("scale")
+        if candidate is not None and np.isfinite(float(candidate)) and float(candidate) > 0:
+            hand_geometry_scale = float(candidate)
     metadata["outputs"]["hamer_pkl"] = scale_hamer_pkl(
         args.hamer_pkl_in,
         args.hamer_pkl_out,
         scale,
+        max_wrist_distance_m=hand_distance_limit,
+        hand_geometry_scale=hand_geometry_scale,
     )
+    print("[Hand filter] metric: " + json.dumps(metadata["outputs"]["hamer_pkl"]["distance_filter"]))
     print(f"Saved scaled hamer pkl: {args.hamer_pkl_out}")
 
     if args.export_frontend_jsonl:
@@ -1979,6 +1800,41 @@ def main() -> None:
         )
         print(f"Saved front-end head JSONL: {frontend_head_out}")
         print(f"Saved front-end hand keypoints JSONL: {frontend_hands_out}")
+
+    if args.objects_parquet_in is not None or args.objects_parquet_out is not None:
+        missing = []
+        for name, value in (
+            ("--objects-parquet-in", args.objects_parquet_in),
+            ("--objects-parquet-out", args.objects_parquet_out),
+            ("--R-align", args.r_align),
+            ("--align-meta", args.align_meta),
+        ):
+            if value is None:
+                missing.append(name)
+        if missing:
+            raise ValueError("--objects-parquet-out requires " + ", ".join(missing))
+
+        R_final, t_floor = load_vggt_to_egoallo_transform(args.r_align, args.align_meta)
+        metadata["outputs"]["frontend_objects_parquet"] = save_frontend_objects_parquet(
+            args.objects_parquet_in,
+            args.objects_parquet_out,
+            R_final,
+            t_floor,
+            scale,
+            args.floor_z,
+        )
+        print(f"Saved front-end objects parquet: {args.objects_parquet_out}")
+
+    object_mesh_ins = list(args.object_mesh_in or [])
+    object_mesh_outs = list(args.object_mesh_out or [])
+    if object_mesh_ins or object_mesh_outs:
+        if len(object_mesh_ins) != len(object_mesh_outs):
+            raise ValueError("--object-mesh-in and --object-mesh-out must have the same count")
+        metadata["outputs"]["object_meshes"] = [
+            scale_object_mesh_glb(mesh_in, mesh_out, scale)
+            for mesh_in, mesh_out in zip(object_mesh_ins, object_mesh_outs)
+        ]
+        print(f"Saved scaled object meshes: {len(object_mesh_outs)}")
 
     args.metadata_out.parent.mkdir(parents=True, exist_ok=True)
     metadata_json = _coerce_json_friendly(metadata)

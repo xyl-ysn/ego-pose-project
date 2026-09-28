@@ -176,6 +176,158 @@ def copy_hand(hand):
     return out
 
 
+def associate_hands_temporally(
+    frame_candidates, times, max_gap_seconds, max_speed_hand_lengths,
+    max_distance_change_ratio,
+):
+    """Build temporary per-side tracks from geometric continuity."""
+    segments = []
+    active = {"left": [], "right": []}
+    for idx, current in enumerate(frame_candidates):
+        for side in ("left", "right"):
+            active[side] = [
+                segment_idx for segment_idx in active[side]
+                if times[idx] - times[segments[segment_idx][-1][0]] <= max_gap_seconds + 1e-9
+            ]
+            side_candidates = [candidate for candidate in current if candidate[1]["side"] == side]
+            matches = []
+            for candidate_idx, candidate in enumerate(side_candidates):
+                _, hand, distance, size = candidate
+                for segment_idx in active[side]:
+                    previous = segments[segment_idx][-1]
+                    dt = times[idx] - times[previous[0]]
+                    step = np.linalg.norm(
+                        hand["world_keypoints_3d"][0] - previous[1]["world_keypoints_3d"][0]
+                    )
+                    limit = (1.0 + max_speed_hand_lengths * dt) * min(size, previous[3])
+                    distance_change = max(distance, previous[2]) / min(distance, previous[2])
+                    if step <= limit and distance_change <= max_distance_change_ratio:
+                        score = max(
+                            float(step / limit),
+                            float(np.log(distance_change) / np.log(max_distance_change_ratio)),
+                        )
+                        matches.append((score, candidate_idx, segment_idx))
+
+            assigned_candidates = set()
+            assigned_segments = set()
+            for _score, candidate_idx, segment_idx in sorted(matches):
+                if candidate_idx in assigned_candidates or segment_idx in assigned_segments:
+                    continue
+                segments[segment_idx].append((*side_candidates[candidate_idx], segment_idx))
+                assigned_candidates.add(candidate_idx)
+                assigned_segments.add(segment_idx)
+
+            for candidate_idx, candidate in enumerate(side_candidates):
+                if candidate_idx in assigned_candidates:
+                    continue
+                segment_idx = len(segments)
+                segments.append([(*candidate, segment_idx)])
+                active[side].append(segment_idx)
+    return segments
+
+
+def filter_near_temporal_hands(
+    items, distance_ratio=3.0, min_support=3, max_gap_seconds=0.6,
+    max_speed_hand_lengths=20.0, ambiguity_ratio=1.25, max_distance_change_ratio=1.5,
+):
+    """Offline heuristic for scenes where the wearer's hands are nearer."""
+    params = (distance_ratio, max_gap_seconds, max_speed_hand_lengths,
+              ambiguity_ratio, max_distance_change_ratio)
+    if not all(np.isfinite(v) for v in params) or distance_ratio <= 1 or min_support < 2:
+        raise ValueError("Near-hand filtering needs distance_ratio > 1 and min_support >= 2")
+    if (max_gap_seconds <= 0 or max_speed_hand_lengths <= 0
+            or ambiguity_ratio <= 1 or max_distance_change_ratio <= 1):
+        raise ValueError("Invalid near-hand temporal or ambiguity threshold")
+    times = np.asarray([item["timestamp"] for item in items], dtype=np.float64)
+    if not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0):
+        raise ValueError("Near-hand filtering requires increasing finite timestamps")
+
+    stats = dict(input=0, kept=0, invalid_geometry=0, short_support=0,
+                 far_relative=0, temporal_jump=0, distance_jump=0,
+                 ambiguous=0, competing_candidate=0, relinked_segments=0)
+    candidates = [[] for _ in items]
+    frame_candidates = [[] for _ in items]
+    for idx, item in enumerate(items):
+        for hand in item["hands"]:
+            stats["input"] += 1
+            camera = valid_points(hand.get("camera_keypoints_3d"))
+            world = valid_points(hand.get("world_keypoints_3d"))
+            size = hand_size_from_keypoints(world)
+            if camera is None or world is None or size is None or camera[0, 2] <= 0:
+                stats["invalid_geometry"] += 1
+                continue
+            distance = float(np.linalg.norm(camera[0]))
+            frame_candidates[idx].append((idx, hand, distance, size))
+
+    segments = associate_hands_temporally(
+        frame_candidates,
+        times,
+        max_gap_seconds,
+        max_speed_hand_lengths,
+        max_distance_change_ratio,
+    )
+
+    supported = [segment for segment in segments if len(segment) >= min_support]
+    stats["short_support"] = sum(len(s) for s in segments if len(s) < min_support)
+    # A persistent near segment, not the closest single-frame outlier, sets the reference.
+    reference = min((float(np.median([c[2] for c in s])) for s in supported), default=None)
+    stats["near_reference_raw"] = reference
+    stats["relative_limit_raw"] = None if reference is None else reference * distance_ratio
+    for segment in supported:
+        for candidate in segment:
+            if candidate[2] > stats["relative_limit_raw"]:
+                stats["far_relative"] += 1
+            else:
+                candidates[candidate[0]].append(candidate)
+
+    active = {}
+    for idx, item in enumerate(items):
+        selected = []
+        for side in ("left", "right"):
+            previous = active.get(side)
+            if previous is not None and times[idx] - times[previous[0]] > max_gap_seconds + 1e-9:
+                previous = None
+                active.pop(side)
+            eligible = []
+            for candidate in candidates[idx]:
+                _, hand, distance, size, _identity = candidate
+                if hand["side"] != side:
+                    continue
+                score = distance
+                if previous is not None:
+                    dt = times[idx] - times[previous[0]]
+                    step = np.linalg.norm(hand["world_keypoints_3d"][0] - previous[1]["world_keypoints_3d"][0])
+                    limit = (1.0 + max_speed_hand_lengths * dt) * min(size, previous[3])
+                    if step > limit:
+                        stats["temporal_jump"] += 1
+                        continue
+                    distance_change = max(distance, previous[2]) / min(distance, previous[2])
+                    if distance_change > max_distance_change_ratio:
+                        stats["distance_jump"] += 1
+                        continue
+                    # Source chunk IDs are not identities. Rank geometric continuity;
+                    # the offset keeps near-zero matching errors from bypassing ambiguity checks.
+                    score = 1.0 + max(
+                        float(step / limit),
+                        float(np.log(distance_change) / np.log(max_distance_change_ratio)),
+                    )
+                eligible.append((score, candidate))
+            eligible.sort(key=lambda entry: entry[0])
+            if len(eligible) > 1 and eligible[1][0] < ambiguity_ratio * eligible[0][0]:
+                stats["ambiguous"] += len(eligible)
+                continue
+            if eligible:
+                chosen = eligible[0][1]
+                if previous is not None and chosen[4] != previous[4]:
+                    stats["relinked_segments"] += 1
+                active[side] = chosen
+                selected.append(chosen[1])
+                stats["kept"] += 1
+                stats["competing_candidate"] += len(eligible) - 1
+        item["hands"] = selected
+    return stats
+
+
 def valid_points(value):
     if value is None:
         return None
@@ -236,6 +388,50 @@ def wrist_and_hand_size(hand):
         if size is not None:
             return arr[0], size
     return None, None
+
+
+def _nominal_dt(timestamps):
+    if timestamps is None:
+        return None
+    ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+    if ts.size < 2:
+        return None
+    dt = np.diff(ts)
+    dt = dt[np.isfinite(dt) & (dt > 1e-8)]
+    if dt.size == 0:
+        return None
+    return float(np.median(dt))
+
+
+def _dt_units(timestamps, prev_idx, idx, nominal_dt):
+    frame_gap = max(1, int(idx) - int(prev_idx))
+    if timestamps is None or nominal_dt is None or nominal_dt <= 0.0:
+        return float(frame_gap)
+    try:
+        dt = float(timestamps[idx]) - float(timestamps[prev_idx])
+    except (IndexError, TypeError, ValueError):
+        return float(frame_gap)
+    if not np.isfinite(dt) or dt <= 1e-8:
+        return float(frame_gap)
+    return max(dt / nominal_dt, 1e-6)
+
+
+def _local_mad_threshold(values, center_idx, window, multiplier, min_samples):
+    if window <= 0 or multiplier <= 0.0:
+        return None
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return None
+    radius = max(1, int(window) // 2)
+    lo = max(0, int(center_idx) - radius)
+    hi = min(values.size, int(center_idx) + radius + 1)
+    local = values[lo:hi]
+    local = local[np.isfinite(local)]
+    if local.size < int(min_samples):
+        return None
+    med = float(np.median(local))
+    mad = float(np.median(np.abs(local - med)))
+    return med + float(multiplier) * max(1.4826 * mad, 1e-6)
 
 
 def iter_segments(track):
@@ -319,10 +515,18 @@ def drop_large_wrist_jumps_raw(track, max_wrist_step):
     return dropped
 
 
-def drop_large_wrist_jumps_relative(track, max_wrist_step_hand_ratio):
+def drop_large_wrist_jumps_relative(
+    track,
+    max_wrist_step_hand_ratio,
+    timestamps=None,
+    local_mad_window=0,
+    local_mad_multiplier=0.0,
+    local_mad_min_samples=4,
+):
     if max_wrist_step_hand_ratio <= 0:
         return 0
-    dropped = 0
+    nominal_dt = _nominal_dt(timestamps)
+    ratios = np.full((len(track),), np.nan, dtype=np.float64)
     prev_idx = None
     prev_wrist = None
     prev_size = None
@@ -331,21 +535,34 @@ def drop_large_wrist_jumps_relative(track, max_wrist_step_hand_ratio):
         if wrist is None or size is None:
             continue
         if prev_wrist is not None and prev_size is not None:
-            frame_gap = max(1, idx - prev_idx)
+            dt_units = _dt_units(timestamps, prev_idx, idx, nominal_dt)
             ref_size = max(1e-8, 0.5 * (float(size) + float(prev_size)))
-            jump_ratio_per_frame = float(np.linalg.norm(wrist - prev_wrist)) / ref_size / frame_gap
-            if jump_ratio_per_frame > max_wrist_step_hand_ratio:
-                track[idx] = None
-                dropped += 1
-                continue
+            ratios[idx] = float(np.linalg.norm(wrist - prev_wrist)) / ref_size / dt_units
         prev_idx = idx
         prev_wrist = wrist
         prev_size = size
+
+    dropped = 0
+    for idx, ratio in enumerate(ratios):
+        if not np.isfinite(ratio) or ratio <= max_wrist_step_hand_ratio:
+            continue
+        local_threshold = _local_mad_threshold(
+            ratios,
+            idx,
+            local_mad_window,
+            local_mad_multiplier,
+            local_mad_min_samples,
+        )
+        if local_threshold is not None and ratio <= local_threshold:
+            continue
+        track[idx] = None
+        dropped += 1
     return dropped
 
 
-def collect_wrist_jump_ratios(track):
+def collect_wrist_jump_ratios(track, timestamps=None):
     ratios = []
+    nominal_dt = _nominal_dt(timestamps)
     prev_idx = None
     prev_wrist = None
     prev_size = None
@@ -354,9 +571,9 @@ def collect_wrist_jump_ratios(track):
         if wrist is None or size is None:
             continue
         if prev_wrist is not None and prev_size is not None:
-            frame_gap = max(1, idx - prev_idx)
+            dt_units = _dt_units(timestamps, prev_idx, idx, nominal_dt)
             ref_size = max(1e-8, 0.5 * (float(size) + float(prev_size)))
-            ratios.append(float(np.linalg.norm(wrist - prev_wrist)) / ref_size / frame_gap)
+            ratios.append(float(np.linalg.norm(wrist - prev_wrist)) / ref_size / dt_units)
         prev_idx = idx
         prev_wrist = wrist
         prev_size = size
@@ -682,14 +899,14 @@ def arrays_to_lists(hand):
     return out
 
 
-def print_jump_stats(side, track):
-    ratios = collect_wrist_jump_ratios(track)
+def print_jump_stats(side, track, timestamps=None):
+    ratios = collect_wrist_jump_ratios(track, timestamps=timestamps)
     if not ratios:
         print(f"{side} wrist jump ratio: no valid adjacent detections")
         return
     arr = np.asarray(ratios, dtype=np.float64)
     print(
-        f"{side} wrist jump ratio per frame, normalized by hand size: "
+        f"{side} wrist jump ratio per normalized dt, normalized by hand size: "
         f"p50={np.percentile(arr, 50):.3f}, "
         f"p90={np.percentile(arr, 90):.3f}, "
         f"p95={np.percentile(arr, 95):.3f}, "
@@ -738,6 +955,13 @@ def build_arg_parser():
     parser.add_argument("--verts-field", default="mesh_vertices_3d")
 
     # Cleanup / stability.
+    parser.add_argument("--near-hand-filter", action="store_true")
+    parser.add_argument("--near-hand-distance-ratio", type=float, default=3.0)
+    parser.add_argument("--near-hand-min-support", type=int, default=3)
+    parser.add_argument("--near-hand-max-gap-seconds", type=float, default=0.6)
+    parser.add_argument("--near-hand-max-speed-hand-lengths", type=float, default=20.0)
+    parser.add_argument("--near-hand-max-distance-change-ratio", type=float, default=1.5)
+    parser.add_argument("--near-hand-ambiguity-ratio", type=float, default=1.25)
     parser.add_argument(
         "--drop-isolated",
         action=argparse.BooleanOptionalAction,
@@ -766,15 +990,36 @@ def build_arg_parser():
         "--max-wrist-step-hand-ratio",
         type=float,
         default=0.0,
-        help="Scale-free jump threshold: wrist motion per frame / hand size. Use 0 to disable. Try 1.0-2.0.",
+        help=(
+            "Scale-free jump threshold: wrist motion / hand size / normalized dt. "
+            "Use 0 to disable. Try 1.0-2.0."
+        ),
+    )
+    parser.add_argument(
+        "--local-mad-window",
+        type=int,
+        default=7,
+        help="Window size for local MAD wrist-velocity outlier check. Use 0 to disable. Default: 7.",
+    )
+    parser.add_argument(
+        "--local-mad-multiplier",
+        type=float,
+        default=6.0,
+        help="MAD multiplier for local wrist-velocity outlier check. Use 0 to disable. Default: 6.",
+    )
+    parser.add_argument(
+        "--local-mad-min-samples",
+        type=int,
+        default=4,
+        help="Minimum local finite wrist velocities required before applying local MAD. Default: 4.",
     )
 
     # Gap fill.
     parser.add_argument(
         "--max-gap-fill",
         type=int,
-        default=3,
-        help="Fill missing detections only for gaps at most this many frames. Use 0 to disable. Default: 3.",
+        default=0,
+        help="Fill missing detections only for gaps at most this many frames. Use 0 to disable. Default: 0.",
     )
     parser.add_argument(
         "--max-gap-endpoint-hand-ratio",
@@ -850,6 +1095,8 @@ def _arg_supplied(*names):
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.near_hand_filter and args.max_gap_fill > 0:
+        parser.error("--near-hand-filter requires --max-gap-fill 0; rejected hands must remain absent")
 
     if args.egoallo_soft_constraint_mode:
         # For EgoAllo soft-constraint mode, do not fabricate missing hands and
@@ -922,45 +1169,44 @@ def main():
                     f"Line {rec.get('_line_no')}, hand {hand_idx}: side must be left/right"
                 )
             conf = hand_confidence(hand)
-            out_hands.append(
-                {
-                    "side": side,
-                    "confidence": conf,
-                    "raw_confidence": conf,
-                    "interpolated": False,
-                    "camera_keypoints_3d": require_points(
-                        hand,
-                        args.camera_keypoints_field,
-                        hand_idx,
-                        rec.get("_line_no"),
-                    ),
-                    "hawor_camera_keypoints_3d": optional_points(
-                        hand,
-                        args.hawor_camera_keypoints_field,
-                        hand_idx,
-                        rec.get("_line_no"),
-                    ),
-                    "world_keypoints_3d": require_points(
-                        hand,
-                        args.keypoints_field,
-                        hand_idx,
-                        rec.get("_line_no"),
-                    ),
-                    "world_mesh_vertices_3d": require_points(
-                        hand,
-                        args.verts_field,
-                        hand_idx,
-                        rec.get("_line_no"),
-                    ),
-                }
-            )
+            out_hand = {
+                "side": side,
+                "confidence": conf,
+                "raw_confidence": conf,
+                "interpolated": False,
+                "camera_keypoints_3d": require_points(
+                    hand,
+                    args.camera_keypoints_field,
+                    hand_idx,
+                    rec.get("_line_no"),
+                ),
+                "hawor_camera_keypoints_3d": optional_points(
+                    hand,
+                    args.hawor_camera_keypoints_field,
+                    hand_idx,
+                    rec.get("_line_no"),
+                ),
+                "world_keypoints_3d": require_points(
+                    hand,
+                    args.keypoints_field,
+                    hand_idx,
+                    rec.get("_line_no"),
+                ),
+                "world_mesh_vertices_3d": require_points(
+                    hand,
+                    args.verts_field,
+                    hand_idx,
+                    rec.get("_line_no"),
+                ),
+            }
+            out_hands.append(out_hand)
 
         items_by_frame[frame_id] = {
             "frame_id": frame_id,
             "timestamp": timestamp,
             "timestamp_ns": int(round(timestamp * 1e9)),
             "src_frame_id": src_frame_id,
-            "hands": list(select_one_hand_per_side(out_hands).values()),
+            "hands": out_hands,
         }
         raw_frame_count += 1
         raw_hand_count += len(out_hands)
@@ -981,6 +1227,18 @@ def main():
                     "hands": [],
                 }
             )
+
+    if args.near_hand_filter:
+        near_stats = filter_near_temporal_hands(
+            items,
+            distance_ratio=args.near_hand_distance_ratio,
+            min_support=args.near_hand_min_support,
+            max_gap_seconds=args.near_hand_max_gap_seconds,
+            max_speed_hand_lengths=args.near_hand_max_speed_hand_lengths,
+            max_distance_change_ratio=args.near_hand_max_distance_change_ratio,
+            ambiguity_ratio=args.near_hand_ambiguity_ratio,
+        )
+        print("[Hand filter] relative/temporal: " + json.dumps(near_stats, sort_keys=True))
 
     tracks = {"left": [None] * len(items), "right": [None] * len(items)}
     for idx, item in enumerate(items):
@@ -1007,8 +1265,9 @@ def main():
     }
 
     for side in ("left", "right"):
+        timestamps = [float(item["timestamp"]) for item in items]
         if args.print_jump_stats:
-            print_jump_stats(f"{side} before filtering", tracks[side])
+            print_jump_stats(f"{side} before filtering", tracks[side], timestamps=timestamps)
 
         stats["dropped_large_jumps_raw"] += drop_large_wrist_jumps_raw(
             tracks[side],
@@ -1017,6 +1276,10 @@ def main():
         stats["dropped_large_jumps_relative"] += drop_large_wrist_jumps_relative(
             tracks[side],
             args.max_wrist_step_hand_ratio,
+            timestamps=timestamps,
+            local_mad_window=args.local_mad_window,
+            local_mad_multiplier=args.local_mad_multiplier,
+            local_mad_min_samples=args.local_mad_min_samples,
         )
         if args.drop_isolated:
             stats["dropped_isolated"] += drop_isolated_detections(tracks[side])
@@ -1057,7 +1320,7 @@ def main():
         )
 
         if args.print_jump_stats:
-            print_jump_stats(f"{side} after filtering", tracks[side])
+            print_jump_stats(f"{side} after filtering", tracks[side], timestamps=timestamps)
 
     num_hands = 0
     num_interpolated = 0

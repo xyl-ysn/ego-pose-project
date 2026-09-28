@@ -60,7 +60,16 @@ def intrinsics_to_row(rec):
     K = np.asarray(rec["intrinsics"], dtype=np.float64)
     if K.shape != (3, 3):
         raise ValueError(f"Line {rec.get('_line_no')}: intrinsics has shape {K.shape}, expected (3, 3)")
-    return [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
+    depth_shape_raw = rec.get("depth_shape")
+    if depth_shape_raw is None:
+        raise KeyError(f"Line {rec.get('_line_no')}: missing depth_shape")
+    depth_shape = np.asarray(depth_shape_raw, dtype=np.int64).reshape(-1)
+    if depth_shape.shape != (2,) or np.any(depth_shape <= 0):
+        raise ValueError(
+            f"Line {rec.get('_line_no')}: depth_shape must contain positive [height, width]"
+        )
+    height, width = depth_shape
+    return [K[0, 0], K[1, 1], K[0, 2], K[1, 2], width, height]
 
 
 def main():
@@ -124,7 +133,7 @@ def main():
             intr_path,
             np.asarray(rows, dtype=np.float64),
             fmt="%.10f",
-            header="fx fy cx cy",
+            header="fx fy cx cy source_width source_height",
             comments="# ",
         )
         print(f"Saved intrinsics: {intr_path}")

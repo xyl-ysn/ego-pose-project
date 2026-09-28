@@ -507,19 +507,15 @@ def run_geocalib_one(model, img_path, path_index, *, device, viz_dir=None, save_
     }
 
 
-def select_anchor_follow_indices(
+def select_anchor_indices(
     *,
     candidates,
-    num_images,
     min_confidence,
     anchor_policy,
     top_k_anchors,
-    follow_frames,
 ):
     anchor_policy = str(anchor_policy or "top_k_best_uncertainty")
     top_k_anchors = max(1, int(top_k_anchors))
-    follow_frames = max(0, int(follow_frames))
-
     valid = [c for c in candidates if _passes_uncertainty(c, min_confidence)]
     valid = sorted(valid, key=_uncertainty_sort_key)
 
@@ -531,18 +527,10 @@ def select_anchor_follow_indices(
         selected_indices = {int(c["path_index"]) for c in valid}
     elif anchor_policy == "best_uncertainty":
         anchors = valid[:1]
-        selected_indices = set()
-        for anchor in anchors:
-            start = int(anchor["path_index"])
-            end = min(num_images - 1, start + follow_frames)
-            selected_indices.update(range(start, end + 1))
+        selected_indices = {int(c["path_index"]) for c in anchors}
     elif anchor_policy == "top_k_best_uncertainty":
         anchors = valid[:top_k_anchors]
-        selected_indices = set()
-        for anchor in anchors:
-            start = int(anchor["path_index"])
-            end = min(num_images - 1, start + follow_frames)
-            selected_indices.update(range(start, end + 1))
+        selected_indices = {int(c["path_index"]) for c in anchors}
     else:
         raise ValueError(
             f"Unsupported anchor_policy={anchor_policy!r}. "
@@ -602,7 +590,7 @@ def main():
         "--save-selected-viz",
         action="store_true",
         help=(
-            "Also save visualization images for selected non-sampled follow frames. "
+            "Also save visualization images for selected anchor frames. "
             "Disabled by default so --save-all-sampled-viz keeps exactly the uniform-sample visualizations."
         ),
     )
@@ -628,7 +616,7 @@ def main():
         choices=["best_uncertainty", "top_k_best_uncertainty", "all_valid"],
         help=(
             "How to choose frames after running GeoCalib on uniformly sampled candidates. "
-            "top_k_best_uncertainty selects the lowest-uncertainty anchors and then takes follow frames."
+            "top_k_best_uncertainty selects the lowest-uncertainty anchors only."
         ),
     )
     parser.add_argument(
@@ -636,12 +624,6 @@ def main():
         type=int,
         default=3,
         help="Number of lowest-uncertainty valid anchors to use when anchor-policy=top_k_best_uncertainty.",
-    )
-    parser.add_argument(
-        "--follow-frames",
-        type=int,
-        default=5,
-        help="For each selected anchor, also save this many consecutive frames after it. Bounded by video length.",
     )
     parser.add_argument(
         "--empty-policy",
@@ -699,7 +681,7 @@ def main():
     print(
         "GeoCalib selection: "
         f"anchor_policy={args.anchor_policy}, top_k_anchors={args.top_k_anchors}, "
-        f"follow_frames={args.follow_frames}, min_confidence={args.min_confidence}, "
+        f"min_confidence={args.min_confidence}, "
         f"empty_policy={args.empty_policy}, "
         f"save_all_sampled_viz={args.save_all_sampled_viz}, "
         f"save_selected_viz={args.save_selected_viz}"
@@ -758,13 +740,11 @@ def main():
                 status += " PASS" if _passes_uncertainty(candidate, args.min_confidence) else " rejected"
             print(status)
 
-        selected_indices, anchors, valid_candidates = select_anchor_follow_indices(
+        selected_indices, anchors, valid_candidates = select_anchor_indices(
             candidates=sampled_candidates,
-            num_images=len(img_paths),
             min_confidence=args.min_confidence,
             anchor_policy=args.anchor_policy,
             top_k_anchors=args.top_k_anchors,
-            follow_frames=args.follow_frames,
         )
 
         if len(selected_indices) == 0:
@@ -835,7 +815,6 @@ def main():
         "num_rejected_selected": int(len(rejected_selected_candidates)),
         "anchor_policy": str(args.anchor_policy),
         "top_k_anchors": int(args.top_k_anchors),
-        "follow_frames": int(args.follow_frames),
         "min_confidence": None if args.min_confidence is None else float(args.min_confidence),
         "anchors": anchor_info,
         "candidate_errors": candidate_errors,
