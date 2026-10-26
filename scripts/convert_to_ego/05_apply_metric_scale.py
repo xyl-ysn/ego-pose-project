@@ -604,7 +604,9 @@ def save_frontend_objects_parquet(
             "valid": bool(row.get("valid", False)),
             "confidence": float(row.get("confidence") or 0.0),
             "coordinate_system": "egoallo_world",
-            "length_unit": "meter",
+            "length_unit": "input_units" if FRONTEND_COORDINATE_SYSTEM["units"] == "input_units" else "meter",
+            **({"reference_only": True, "ground_plane_trusted": False, "metric_scale_trusted": False}
+               if FRONTEND_COORDINATE_SYSTEM.get("reference_only") else {}),
         }
 
         matrix = row.get("T_world_from_object")
@@ -638,19 +640,28 @@ def save_frontend_objects_parquet(
 
 
 def scale_object_mesh_glb(input_path: Path, output_path: Path, scale: float) -> dict:
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Object metric scale must be finite and positive")
     try:
         import trimesh
     except Exception as exc:  # pragma: no cover - dependency diagnostic
         raise RuntimeError("trimesh is required to process object GLB meshes") from exc
 
-    scene = trimesh.load(input_path, force="scene")
+    scene = trimesh.load(input_path, force="scene", process=False)
+    # Object poses already scale their world translation. Scale the complete
+    # canonical scene about its local origin, including node translations,
+    # so R_out @ (scale * v_local) + t_out is the same global similarity
+    # applied to the original object surface. HaWoR's camera Sim3 is unrelated.
+    scene.apply_scale(float(scale))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     scene.export(str(output_path))
     return {
         "input": str(input_path),
         "output": str(output_path),
-        "scale_applied": False,
+        "scale_applied": True,
         "global_scale": float(scale),
+        "local_geometry_scale": float(scale),
+        "scale_origin": "object_local_origin",
     }
 
 
@@ -662,7 +673,11 @@ def save_frontend_hand_and_wrist_jsonl(
     scale: float,
     floor_z: float,
     include_mesh: bool,
+    hand_geometry_scale: float | None = None,
 ) -> dict:
+    geometry_scale = float(scale if hand_geometry_scale is None else hand_geometry_scale)
+    if not np.isfinite(scale) or scale <= 0 or not np.isfinite(geometry_scale) or geometry_scale <= 0:
+        raise ValueError("Hand scene and geometry scales must be finite and positive")
     hands_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     frames = 0
@@ -703,7 +718,7 @@ def save_frontend_hand_and_wrist_jsonl(
                     floor_z,
                 ).reshape(3)
                 keypoints_scaled = (
-                    wrist_scaled + (keypoints_ego - wrist_ego)
+                    wrist_scaled + geometry_scale * (keypoints_ego - wrist_ego)
                 ).astype(np.float32)
                 wrist = wrist_scaled.astype(np.float32).tolist()
                 conf = hand_confidence(hand)
@@ -723,7 +738,7 @@ def save_frontend_hand_and_wrist_jsonl(
                         t_floor,
                     )
                     mesh_scaled = (
-                        wrist_scaled + (mesh_ego - wrist_ego)
+                        wrist_scaled + geometry_scale * (mesh_ego - wrist_ego)
                     ).astype(np.float32)
                     hand_out["mesh_vertices_3d"] = mesh_scaled.tolist()
 
@@ -745,6 +760,8 @@ def save_frontend_hand_and_wrist_jsonl(
         "hands_output": str(hands_output_path),
         "frames": int(frames),
         "hands": int(hands_count),
+        "scene_translation_scale": float(scale),
+        "hand_geometry_scale": geometry_scale,
     }
 
 
@@ -1445,6 +1462,16 @@ def try_hand_scale(
 
 
 def decide_metric_scale(args: argparse.Namespace, head_poses: np.ndarray) -> tuple[float, dict]:
+    if getattr(args, "alignment_only", False):
+        diag = height_diagnostics(head_poses, args.floor_z, 1.0)
+        diag.update({
+            "status": "skipped", "reason": getattr(args, "alignment_only_reason", "imu_floor_estimation_failed"),
+            "selected_source": "none", "scale_method": "alignment_only",
+            "metric_scale_trusted": False, "ground_plane_trusted": False,
+            "reference_only": True, "attempts": [],
+            "warning": "Floor estimation failed; preserve input scale and export rigid alignment only.",
+        })
+        return 1.0, diag
     attempts: list[dict] = []
     candidates: list[tuple[str, float, dict]] = []
 
@@ -1571,7 +1598,12 @@ def main() -> None:
     )
 
     # Metric-scale parameters. These are normally read from YAML by run_body_mesh.py.
+    parser.add_argument(
+        "--alignment-only", action="store_true",
+        help="Skip all scale estimation and height caps; export the rigid alignment with scale=1.",
+    )
     parser.add_argument("--floor-z", type=float, default=0.0)
+    parser.add_argument("--alignment-only-reason", default="imu_floor_estimation_failed")
     parser.add_argument("--depth-scale-json", type=Path, default=None)
     parser.add_argument("--hand-scale-enabled", type=int, default=1)
     parser.add_argument("--hand-scale-bones-json", type=Path, default=None)
@@ -1654,8 +1686,13 @@ def main() -> None:
 
     head_poses = load_head_trajectory(args.head_trajectory_in)
     scale, scale_info = decide_metric_scale(args, head_poses)
+    if args.alignment_only:
+        FRONTEND_COORDINATE_SYSTEM.update(units="input_units", reference_only=True,
+                                         ground_plane_trusted=False, metric_scale_trusted=False)
 
     metadata = {
+        "alignment_only": bool(args.alignment_only),
+        "applied_scale": float(scale),
         "scale_info": scale_info,
         "scale_source": scale_info.get("selected_source", scale_info.get("reason")),
         "scale_method": scale_info.get("scale_method", scale_info.get("reason")),
@@ -1797,6 +1834,7 @@ def main() -> None:
             scale,
             args.floor_z,
             args.frontend_include_mesh,
+            hand_geometry_scale=hand_geometry_scale,
         )
         print(f"Saved front-end head JSONL: {frontend_head_out}")
         print(f"Saved front-end hand keypoints JSONL: {frontend_hands_out}")

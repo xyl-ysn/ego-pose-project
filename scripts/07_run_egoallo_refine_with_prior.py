@@ -14,6 +14,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from runtime_threads import torch_cpu_threads
+
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 _DEFAULT_JAX_CACHE_DIR = Path(os.path.expanduser("~/.cache/egoallo/jax_compilation_cache")).resolve()
@@ -90,6 +92,17 @@ def resolve_project_path(value: str | Path) -> Path:
     return path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
 
 
+def resolve_torch_device(value: str) -> torch.device:
+    device = torch.device(value)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but unavailable; use --device cpu explicitly")
+        # JAX compilation can change the current CUDA device after model loading.
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EgoAllo with a noise-matched EgoGVAE leg reference and bounded leg stabilization.")
     for name in ("reference-motion-npz", "hamer-outputs-path", "output-dir", "egoallo-root", "checkpoint-dir", "smplh-npz-path"):
@@ -107,6 +120,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=int, default=128)
     parser.add_argument("--overlap-size", type=int, default=32)
     parser.add_argument("--hamer-abspos-weight", type=float, default=20.0)
+    parser.add_argument("--hand-reachability-fade-ratio", type=float, default=0.35,
+                        help="Fade spatial hand residuals to their minimum weight over this fraction of arm length beyond reach.")
+    parser.add_argument("--hand-reachability-min-weight", type=float, default=0.05,
+                        help="Minimum multiplier for existing spatial hand residual weights; must be in (0,1].")
     parser.add_argument("--inner-max-iters", type=int, default=2)
     parser.add_argument("--inner-last-steps", type=int, default=0)
     parser.add_argument("--inner-step-frequency", type=int, default=1)
@@ -128,6 +145,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-refinement-max-deg", type=float, default=0.0)
     parser.add_argument("--floor-z", type=float, default=0.0)
     parser.add_argument("--verbose", action="store_true")
+    warmup = parser.add_mutually_exclusive_group()
+    warmup.add_argument("--prewarm-guidance", dest="prewarm_guidance", action="store_true",
+                        help="Prepare guidance executables before sampling (default).")
+    warmup.add_argument("--skip-guidance-prewarm", dest="prewarm_guidance", action="store_false",
+                        help="Skip discarded warmup solves; faster, but downstream numerical equivalence is not established.")
+    parser.set_defaults(prewarm_guidance=True)
+    parser.add_argument("--guidance-warmup-mode", choices=("compile", "solve"), default="compile",
+                        help="compile prepares cached executables; solve also runs discarded legacy solves.")
     return parser.parse_args()
 
 
@@ -254,6 +279,66 @@ def build_hamer_wrist_targets_world(
     return targets, weights
 
 
+@torch.no_grad()
+def downweight_unreachable_hands(
+    detections: Any, reference_joints: torch.Tensor, Ts_world_cpf: np.ndarray,
+    fade_ratio: float = 0.35, min_weight: float = 0.05,
+) -> tuple[Any, dict[str, Any]]:
+    """Use fixed reference shoulders so bending the torso cannot restore weight."""
+    from egoallo.transforms import SE3
+
+    if not np.isfinite(fade_ratio) or fade_ratio <= 0:
+        raise ValueError("hand-reachability-fade-ratio must be positive and finite")
+    if not np.isfinite(min_weight) or not 0 < min_weight <= 1:
+        raise ValueError("hand-reachability-min-weight must be finite and in (0,1]")
+    if (reference_joints.shape != (len(Ts_world_cpf), 51, 3)
+            or not torch.isfinite(reference_joints).all()):
+        raise ValueError("Hand reachability requires finite reference joints [T,51,3]")
+    for side in ("left", "right"):
+        concat = getattr(detections, f"detections_{side}_concat")
+        if concat is not None:
+            idx = concat.indices
+            if bool(((idx < 0) | (idx >= len(Ts_world_cpf))).any()) or len(torch.unique(idx)) != len(idx):
+                raise ValueError("Hand observation indices must be unique and within the reference motion")
+    targets, _ = build_hamer_wrist_targets_world(detections, Ts_world_cpf, SE3)
+    targets = torch.as_tensor(targets, device=reference_joints.device, dtype=reference_joints.dtype)
+    updates = {}
+    report: dict[str, Any] = dict(reference="egogvae_sample_0", fade_ratio=fade_ratio, min_weight=min_weight)
+    for side_index, side in enumerate(("left", "right")):
+        concat = getattr(detections, f"detections_{side}_concat")
+        if concat is None or not len(concat.indices):
+            report[side] = dict(detections=0, downweighted=0, disabled=0, at_min_weight=0)
+            continue
+        idx = concat.indices.to(reference_joints.device)
+        shoulder = reference_joints[idx, 15 + side_index]
+        elbow = reference_joints[idx, 17 + side_index]
+        wrist = reference_joints[idx, 19 + side_index]
+        arm_length = (elbow - shoulder).norm(dim=-1) + (wrist - elbow).norm(dim=-1)
+        distance = (targets[idx, side_index] - shoulder).norm(dim=-1)
+        if not torch.isfinite(distance).all() or bool((arm_length <= 0).any()):
+            raise ValueError(f"Non-finite {side} wrist target or invalid reference arm length")
+        excess_ratio = (distance / arm_length - 1).clamp(min=0)
+        fraction = (excess_ratio / fade_ratio).clamp(max=1)
+        multiplier = min_weight + (1 - min_weight) * (1 - fraction).square() * (1 + 2 * fraction)
+        # Both residuals move the full body. Local finger poses remain useful
+        # even when an observation's absolute depth is incompatible with reach.
+        updates[f"detections_{side}_concat"] = dataclasses.replace(
+            concat,
+            wrist_pose_weight=concat.wrist_pose_weight * multiplier.to(concat.wrist_pose_weight),
+            hand_reproj_weight=concat.hand_reproj_weight * multiplier.to(concat.hand_reproj_weight),
+        )
+        active = (concat.wrist_pose_weight > 0) | (concat.hand_reproj_weight > 0)
+        active = active.to(multiplier.device)
+        report[side] = dict(
+            detections=len(idx), downweighted=int(((multiplier < 1) & active).sum()),
+            disabled=int(((multiplier == 0) & active).sum()),
+            at_min_weight=int(((multiplier <= min_weight) & active).sum()),
+            median_excess_m=float((distance - arm_length).clamp(min=0).median()),
+            median_residual_multiplier=float(multiplier.median()),
+        )
+    return dataclasses.replace(detections, **updates), report
+
+
 def resolve_guidance_buckets(args: argparse.Namespace, max_infer: int, max_detections: int) -> tuple[int, int]:
     if str(args.bucket_t).strip().lower() == "auto":
         if args.target_segment_length <= 0:
@@ -275,9 +360,22 @@ def resolve_guidance_buckets(args: argparse.Namespace, max_infer: int, max_detec
 def max_segment_detection_count(all_hamer: Any, tasks: list[SegmentTask]) -> int:
     out = 0
     for task in tasks:
-        counts = detection_count(all_hamer.slice(task.infer_start, task.infer_end))
-        out = max(out, counts["left"], counts["right"])
+        assert task.infer_start < task.infer_end  # Match CorrespondedHamerDetections.slice.
+        for side in ("left", "right"):
+            concat = getattr(all_hamer, f"detections_{side}_concat", None)
+            if concat is not None:
+                indices = concat.indices
+                # Match slice's half-open mask without copying vertices, poses,
+                # and weights merely to count the retained observations.
+                count = torch.count_nonzero((indices >= task.infer_start) & (indices < task.infer_end))
+                out = max(out, int(count.item()))
     return out
+
+
+def slice_hamer_for_segment(all_hamer: Any, task: SegmentTask, device: torch.device) -> Any:
+    with torch_cpu_threads():
+        segment_hamer = all_hamer.slice(task.infer_start, task.infer_end)
+    return segment_hamer.to(device)
 
 
 def jsonable(value: Any) -> Any:
@@ -318,6 +416,30 @@ def guidance_schedule_kwargs(args: argparse.Namespace) -> dict[str, int]:
     return kwargs
 
 
+def track_jax_cache_events() -> dict[str, int | float]:
+    """Observe actual JAX cache events, independently of directory contents."""
+    from jax import monitoring
+
+    stats: dict[str, int | float] = dict(requests=0, hits=0, miss_writes=0, load_seconds=0.0)
+    names = {
+        "/jax/compilation_cache/compile_requests_use_cache": "requests",
+        "/jax/compilation_cache/cache_hits": "hits",
+        "/jax/compilation_cache/cache_misses": "miss_writes",
+    }
+
+    def event(name, **metadata):
+        if name in names:
+            stats[names[name]] += 1
+
+    def duration(name, seconds, **metadata):
+        if name == "/jax/compilation_cache/cache_retrieval_time_sec":
+            stats["load_seconds"] += seconds
+
+    monitoring.register_event_listener(event)
+    monitoring.register_event_duration_secs_listener(duration)
+    return stats
+
+
 def main() -> None:
     args = parse_args()
     if not np.isfinite(args.lower_body_reference_strength) or not 0 <= args.lower_body_reference_strength <= 1:
@@ -327,6 +449,10 @@ def main() -> None:
         raise ValueError("Invalid sample count or sampling window")
     if args.leg_max_iters < 0 or args.body_smoothing_max_deg < 0 or args.hamer_abspos_weight < 0:
         raise ValueError("Optimization budgets and weights must be nonnegative")
+    if not np.isfinite(args.hand_reachability_fade_ratio) or args.hand_reachability_fade_ratio <= 0:
+        raise ValueError("hand-reachability-fade-ratio must be positive and finite")
+    if not np.isfinite(args.hand_reachability_min_weight) or not 0 < args.hand_reachability_min_weight <= 1:
+        raise ValueError("hand-reachability-min-weight must be finite and in (0,1]")
     if not np.isfinite(args.leg_max_correction_deg) or not 0 <= args.leg_max_correction_deg <= 10:
         raise ValueError("leg-max-correction-deg must be between 0 and 10")
     if not np.isfinite(args.hand_refinement_max_deg) or not 0 <= args.hand_refinement_max_deg <= 5:
@@ -343,14 +469,16 @@ def main() -> None:
                                   viewer_motion, ground_below_chest, validate_grounding_options)
     from egoallo_hand_refinement import refine_hands
 
+    jax_cache_events = track_jax_cache_events()
+    print("[JAX CACHE] startup_mode=" + (args.guidance_warmup_mode if args.prewarm_guidance else "on_demand")
+          + " persistent_cache=" + os.environ.get("JAX_COMPILATION_CACHE_DIR", ""), flush=True)
+
     validate_grounding_options(args.grounding_spine_max_deg, args.grounding_leg_max_deg,
                                args.grounding_max_iters, args.grounding_smoothing_seconds, floor_z=args.floor_z)
     if (not np.isfinite([args.grounding_foot_xy_max_m, args.grounding_foot_rotation_max_deg]).all()
             or not 0 < args.grounding_foot_xy_max_m <= .05 or not 0 < args.grounding_foot_rotation_max_deg <= 8):
         raise ValueError('Support correction limits must be positive and at most 0.05 m / 8 degrees')
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable; use --device cpu explicitly")
+    device = resolve_torch_device(args.device)
     reference_path = resolve_project_path(args.reference_motion_npz)
     with np.load(reference_path, allow_pickle=False) as file:
         reference = {key: file[key] for key in file.files}
@@ -360,9 +488,22 @@ def main() -> None:
     timestamps = load_timestamps(reference, len(cpf))
     output_dir = resolve_project_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    all_hamer = CorrespondedHamerDetections.load(resolve_project_path(args.hamer_outputs_path), timestamps)
-    body_model = fncsmpl.SmplhModel.load(resolve_project_path(args.smplh_npz_path)).to(device)
-    net = load_denoiser(resolve_project_path(args.checkpoint_dir)).to(device).eval()
+    with torch_cpu_threads():
+        all_hamer = CorrespondedHamerDetections.load(resolve_project_path(args.hamer_outputs_path), timestamps)
+        body_model = fncsmpl.SmplhModel.load(resolve_project_path(args.smplh_npz_path))
+        tensor = lambda value: torch.as_tensor(value, dtype=torch.float32)
+        reference_q = tensor(np.concatenate(
+            [reference[key][0] for key in ("body_quats", "left_hand_quats", "right_hand_quats")], axis=1))
+        reference_pose = body_model.with_shape(tensor(reference["betas"][0])).with_pose(
+            tensor(reference["Ts_world_root"][0]), reference_q)
+        all_hamer, hand_reachability = downweight_unreachable_hands(
+            all_hamer, reference_pose.Ts_world_joint[..., 4:], cpf,
+            args.hand_reachability_fade_ratio, args.hand_reachability_min_weight)
+        del reference_pose, reference_q
+        net = load_denoiser(resolve_project_path(args.checkpoint_dir))
+    print("[EgoAllo] hand reachability " + json.dumps(hand_reachability), flush=True)
+    body_model = body_model.to(device)
+    net = net.to(device).eval()
     if not net.config.include_hands:
         raise ValueError("Checkpoint must include hands")
     tasks = build_segment_tasks(len(cpf), args.target_segment_length, args.context_frames, True)
@@ -386,12 +527,14 @@ def main() -> None:
         traj, timing = run_sampling_with_stitching(
             net, body_model=body_model, guidance_mode=args.guidance_mode,
             guidance_post=True, guidance_inner=True, Ts_world_cpf=sample_cpf,
-            floor_z=args.floor_z, hamer_detections=all_hamer.slice(task.infer_start, task.infer_end).to(device),
+            floor_z=args.floor_z, hamer_detections=slice_hamer_for_segment(all_hamer, task, device),
             aria_detections=None, num_samples=args.num_samples, device=device,
             guidance_verbose=args.verbose, window_size=args.window_size, overlap_size=args.overlap_size,
             guidance_params_inner=params["inner"], guidance_params_post=params["post"],
             constraint_optimization_bucket_t=bucket_t,
-            constraint_optimization_warmup_before_segments=True,
+            # Prepare the original JAX executables without executing dummy solves.
+            constraint_optimization_warmup_before_segments=args.prewarm_guidance,
+            constraint_optimization_warmup_mode=args.guidance_warmup_mode,
             constraint_optimization_detection_bucket=detection_bucket, return_timing=True,
             lower_body_reference=None if reference_packed is None else reference_packed[:, task.infer_start:task.infer_end],
             lower_body_reference_noise=None if reference_noise is None else reference_noise[:, task.infer_start:task.infer_end],
@@ -410,7 +553,10 @@ def main() -> None:
                           body_rotmats=traj.body_rotmats, hand_rotmats=traj.hand_rotmats,
                           left_hand_rotmats=traj.hand_rotmats[:, :, :15], right_hand_rotmats=traj.hand_rotmats[:, :, 15:])
             parts.append({key: value[:, task.crop_start:task.crop_end].cpu().numpy() for key, value in values.items()})
-        segment_reports.append(dict(segment=dataclasses.asdict(task), timing=jsonable(timing)))
+        cache_snapshot = dict(jax_cache_events)
+        print("[JAX CACHE] source=jax.monitoring " + json.dumps(cache_snapshot), flush=True)
+        segment_reports.append(dict(segment=dataclasses.asdict(task), timing=jsonable(timing),
+                                    jax_cache_events=cache_snapshot))
     raw = {key: np.concatenate([part[key] for part in parts], axis=1) for key in parts[0]}
     raw.update(Ts_world_cpf=cpf, timestamps=np.asarray(timestamps),
                timestamps_ns=np.asarray(reference.get("timestamps_ns", np.rint(np.asarray(timestamps) * 1e9)), dtype=np.int64),
@@ -444,7 +590,8 @@ def main() -> None:
         for key in parts[0]:
             single[key] = raw[key][index:index + 1]
         single = smooth_body(single, body_model, device, args.body_smoothing_max_deg)
-        single = viewer_motion(single)
+        with torch_cpu_threads():
+            single = viewer_motion(single)
         support_reference = single
         contact = contact_probabilities(single, device)
         grounding_contact = ((contact - 0.6) / 0.25).clamp(0, 1)
@@ -498,7 +645,11 @@ def main() -> None:
                   lower_body_reference_seed=args.lower_body_reference_seed, reference_sample_index=0,
                   shape_policy="guidance_segment_mean",
                   guidance_weights={phase: dataclasses.asdict(value) for phase, value in params.items()},
+                  hand_reachability=hand_reachability,
                   guidance_schedule=schedule,
+                  guidance_dummy_prewarm=args.prewarm_guidance and args.guidance_warmup_mode == "solve",
+                  guidance_warmup_mode=args.guidance_warmup_mode if args.prewarm_guidance else "off",
+                  jax_cache_events=dict(jax_cache_events),
                   guidance_buckets=dict(bucket_t=bucket_t, detection_bucket=detection_bucket),
                   body_smoothing_max_deg=args.body_smoothing_max_deg, contact_source=args.contact_source,
                   reference_contact_shape="saved_per_frame",

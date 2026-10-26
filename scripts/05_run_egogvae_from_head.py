@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from runtime_threads import torch_cpu_threads
+
 TOP_LEVEL_IMPORT_SEC = time.perf_counter() - TOP_LEVEL_IMPORT_STARTED
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -158,7 +160,9 @@ def forward_test(model: torch.nn.Module, head: torch.Tensor, *, print_shape: boo
 def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
     from model.network import Head2Motion
 
-    model = Head2Motion(head_dim=16, motion_dim=135, out_dim=126 + 16 + 21).to(device)
+    with torch_cpu_threads():
+        model = Head2Motion(head_dim=16, motion_dim=135, out_dim=126 + 16 + 21)
+    model = model.to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model.load_state_dict(state)
@@ -239,7 +243,8 @@ def save_output(
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     frame_count = int(body_quats.shape[1])
     frame_nums = np.arange(start_index, start_index + frame_count, dtype=np.int64)
-    timestamps_ns = (timestamps[1:] * 1e9).astype(np.int64)
+    # Recover integer nanoseconds by rounding, not truncating float roundoff.
+    timestamps_ns = np.rint(timestamps[1:] * 1e9).astype(np.int64)
 
     np.savez(
         output_npz,
@@ -364,7 +369,8 @@ def main() -> None:
     timings_sec["window_inference_sec"] = time.perf_counter() - inference_started
 
     smplh_started = time.perf_counter()
-    body_model = fncsmpl.SmplhModel.load(smplh_npz_path)
+    with torch_cpu_threads():
+        body_model = fncsmpl.SmplhModel.load(smplh_npz_path)
     timings_sec["smplh_load_sec"] = time.perf_counter() - smplh_started
 
     params = {
@@ -386,27 +392,29 @@ def main() -> None:
         "transition_region_max": int(args.transition_region_max),
     }
     selection_started = time.perf_counter()
-    selected = select_and_blend(windows, body_model, SO3, SE3, params)
+    with torch_cpu_threads():
+        selected = select_and_blend(windows, body_model, SO3, SE3, params)
     timings_sec["selection_sec"] = time.perf_counter() - selection_started
     elapsed = time.perf_counter() - started
 
-    save_output(
-        output_npz=args.output_dir.expanduser().resolve() / args.output_name,
-        report_json=args.report_json.expanduser().resolve() if args.report_json else None,
-        smplh_npz_path=smplh_npz_path,
-        body_model=body_model,
-        T_world_cpf=T_world_cpf,
-        timestamps=timestamps,
-        selected=selected,
-        start_index=start,
-        window_size=int(args.window_size),
-        stride=int(args.window_stride),
-        latent_mode=str(args.latent_mode),
-        inference_device=str(device),
-        elapsed_sec=elapsed,
-        timings_sec=timings_sec,
-        total_started=total_started,
-    )
+    with torch_cpu_threads():
+        save_output(
+            output_npz=args.output_dir.expanduser().resolve() / args.output_name,
+            report_json=args.report_json.expanduser().resolve() if args.report_json else None,
+            smplh_npz_path=smplh_npz_path,
+            body_model=body_model,
+            T_world_cpf=T_world_cpf,
+            timestamps=timestamps,
+            selected=selected,
+            start_index=start,
+            window_size=int(args.window_size),
+            stride=int(args.window_stride),
+            latent_mode=str(args.latent_mode),
+            inference_device=str(device),
+            elapsed_sec=elapsed,
+            timings_sec=timings_sec,
+            total_started=total_started,
+        )
     timing_text = " ".join(f"{key}={value:.3f}s" for key, value in timings_sec.items())
     print(f"[EgoGVAE timing] frames={selected['body_quats'].shape[0]} windows={len(windows)} {timing_text}", flush=True)
     print(f"Saved EgoGVAE output: {args.output_dir / args.output_name}")

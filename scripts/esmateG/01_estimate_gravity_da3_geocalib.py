@@ -1649,6 +1649,57 @@ def find_low_floor_candidates_along_imu_axis(
     return candidates, search_stats
 
 
+def make_imu_display_reference(P, up, params):
+    """Choose a noise-resistant low reference, not a validated physical floor.
+
+    Gravity stays exactly on the measured IMU axis. The reference only defines
+    an origin for consistent exports when the normal floor search has failed.
+    """
+    up = normalize(up)
+    candidates, search = find_low_floor_candidates_along_imu_axis(
+        P, up, params, cam_centers=None, max_refine_angle_deg=0.0,
+    )
+    if candidates:
+        candidate = dict(min(candidates, key=lambda c: c["level"]))
+        mask = candidate["mask"].copy()
+        method = "imu_fixed_axis_low_supported_plane"
+        level = float(np.median(P[mask] @ up))
+        denoise_status = "connected_plane_support"
+    else:
+        # Never let one extreme point define the display origin. This last
+        # resort is explicitly a lower-envelope reference, not a fitted floor.
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(P)
+        retained = np.arange(len(P))
+        if len(P) > 20:
+            _, kept = cloud.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            if len(kept) >= 3:
+                retained = np.asarray(kept, dtype=int)
+        denoise_status = "statistical_outlier_filter" if len(retained) < len(P) else "percentile_only"
+        heights = P[retained] @ up
+        low_cutoff = float(np.percentile(heights, 2.0))
+        level = float(np.median(heights[heights <= low_cutoff]))
+        mask = np.zeros(len(P), dtype=bool)
+        mask[retained[np.abs(heights - level) <= params["distance_threshold"]]] = True
+        if not mask.any():
+            mask[retained[int(np.argmin(np.abs(heights - level)))]] = True
+        method = "imu_denoised_lower_envelope_reference"
+        candidate = {"low_percentile": 2.0, "plane_in_band": 0, "score": 0.0,
+                     "min_inliers": IMU_FLOOR_MIN_INLIERS_ABS}
+
+    center = np.median(P[mask], axis=0)
+    center = center + (level - float(center @ up)) * up
+    stats = refined_floor_stats(P, mask, center, up, params)
+    candidate.update({
+        "normal": up.tolist(), "center": center, "mask": mask,
+        "method": method, "level": level, "inliers": stats["inliers"],
+        "inlier_ratio": stats["inlier_ratio"], "rms": stats["rms"], "area": stats["area"],
+        "height_rank": float(np.mean(P @ up < level)),
+        "reference_only": True, "denoise_status": denoise_status,
+    })
+    return candidate, search
+
+
 def refined_floor_stats(P, floor_mask, floor_center, up, params):
     """Support statistics for a floor plane after coarse-to-fine refinement."""
     up = normalize(up)
@@ -2215,9 +2266,6 @@ def main():
                 f"min_inliers={imu_floor_search['min_inliers']}",
                 flush=True,
             )
-            if not imu_floor_candidates:
-                raise RuntimeError("IMU low-plane search returned no floor candidate.")
-
             imu_head_thresholds = {
                 "min_valid_camera_height_margin_factor": args.min_valid_camera_height_margin_factor,
                 "min_camera_above_floor_ratio": args.min_camera_above_floor_ratio,
@@ -2300,12 +2348,15 @@ def main():
                 break
 
             if chosen is None:
-                best_effort = min(imu_attempts, key=lambda a: a["refine_angle_deg"])
                 imu_reject_reason = (
-                    "no_low_plane_within_refine_angle: best_angle="
-                    f"{best_effort['refine_angle_deg']:.6f} deg > "
-                    f"{float(args.imu_max_refine_angle_deg):.6g} deg "
-                    f"over {len(imu_attempts)} candidates"
+                    "no_floor_candidate" if not imu_attempts
+                    else "no_low_plane_within_refine_angle"
+                )
+                reference, reference_search = make_imu_display_reference(P, up_imu, params)
+                best_effort = evaluate_imu_floor_candidate(
+                    P, cam_centers, params, up_imu, reference,
+                    max_refine_angle_deg=args.imu_max_refine_angle_deg,
+                    **imu_head_thresholds,
                 )
 
             imu_valid = chosen is not None
@@ -2400,6 +2451,11 @@ def main():
                 )
             else:
                 print(f"[IMU] rejected: {imu_reject_reason}", flush=True)
+                used_imu_gravity = True
+                imu_stats["status"] = "fallback_alignment_only"
+                imu_stats["fallback_reference_search"] = reference_search
+                imu_stats["metric_scale_trusted"] = False
+                imu_stats["reference_only"] = True
                 up = normalize(imu_up)
                 floor_center = imu_floor_center
                 floor_mask = imu_floor_mask
@@ -2418,12 +2474,13 @@ def main():
                 })
                 final_camera_height_stats = imu_height_stats
                 final_floor_position_stats = imu_floor_position_stats
-                final_height_valid = bool(imu_height_valid)
-                final_height_reason = str(imu_height_reason)
-                decision_reason = f"imu_low_plane_refine_angle_failed_no_egogvae: {imu_reject_reason}"
+                final_height_valid = False
+                final_height_reason = f"unvalidated_display_reference: {imu_reject_reason}"
+                decision_reason = f"imu_fallback_alignment_only: {imu_reject_reason}"
                 print(
-                    "[IMU] Alignment failed; writing diagnostic alignment files and "
-                    "leaving accepted=false so the main pipeline skips EgoGVAE.",
+                    "[IMU] Floor estimation failed; exporting fixed-IMU alignment with "
+                    f"reference={reference['method']} level={reference['level']:.6g}. "
+                    "accepted=false; skip metric scale and body inference.",
                     flush=True,
                 )
 
@@ -2870,7 +2927,9 @@ def main():
         }
         print("[IMU] Saved rotation:", args.out)
         print("[IMU] Saved metadata:", args.out_meta)
-        if used_imu_gravity:
+        if imu_stats.get("reference_only"):
+            alignment_source = "imu_fallback_alignment_only"
+        elif used_imu_gravity:
             alignment_source = "imu_guided_low_floor_refined"
         else:
             alignment_source = "imu_failed_no_ransac_fallback"

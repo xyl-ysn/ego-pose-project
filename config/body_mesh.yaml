@@ -66,6 +66,13 @@ env:
 config: &body_mesh_config
   runtime:
     device: cuda
+    # CPU preprocessing only; set before imports in its child processes.
+    # Existing OMP/MKL/OPENBLAS/etc. environment values take precedence.
+    # 0 keeps library defaults. EGO_UNI_PREPROCESS_THREADS overrides this value.
+    preprocess_threads: 1
+    # Scoped to CPU model loading/FK/rotation export, restored before GPU operations.
+    # 0 disables; EGO_UNI_TORCH_CPU_THREADS overrides this value.
+    torch_cpu_threads: 1
 
   model_sources:
     egogvae_root: ../exp/EgoGVAE_release
@@ -121,7 +128,9 @@ config: &body_mesh_config
     max_camera_distance_m: 1.2
 
   hawor_extract:
-    # 1 disables endpoint fading; retain observed constraints for EgoAllo guidance.
+    # Scale-estimation preprocessing only. EgoAllo/frontend use upstream
+    # hands_30fps.parquet directly, bypassing 02/03 filtering/smoothing/gap fill.
+    # 1 disables endpoint fading.
     soft_start_frames: 1
     soft_end_frames: 1
     min_output_alpha: 0.0
@@ -155,8 +164,9 @@ config: &body_mesh_config
     duplicate_mode: keep_best
 
   hamer_build:
+    # Interpolate cam_space MANO parameters from camera.parquet timestamps
+    # to the upstream 30 FPS hand/camera timeline.
     mano_frame_key: frame_id
-    mano_lookup_field: frame_id
     cam_space_left_subdir: "0"
     cam_space_right_subdir: "1"
 
@@ -205,7 +215,9 @@ config: &body_mesh_config
     # 5. 每个分位内逐次拟合并移除平面，最多 8 个；该分位候选全部不合格后再进入下一分位；
     #    refine_floor_coarse_to_fine 仅用当前候选内点精修，不重新吸纳已移除平面或分位外点；
     # 6. 重估法向与 IMU 方向夹角 <= imu_max_refine_angle_deg，则接受该 refine 后的地面方向；
-    # 7. 所有候选角度都超限，则标记 IMU 对齐失败，仍输出对齐文件/点云/前端输入，后续跳过 EgoGVAE。
+    # 7. 没有地面候选或所有候选角度超限时，固定使用 IMU 方向，以低处有支持的水平面
+    #    （无平面时用去噪后的低处分位参考）确定原点；点云、相机、手和物体使用同一刚体变换。
+    #    此时 accepted=false，保持输入尺度，跳过尺度估计和人体推理，输出空人体 NPZ。
     # 头部高度/地面低包络校验仍写日志和元数据，但在真实 IMU 模式下只做诊断，不阻断接受。
     # 日志统一带 [IMU] 前缀，和无 IMU 的 GeoCalib 日志区分开。
 
@@ -242,9 +254,32 @@ config: &body_mesh_config
     # 真实深度尺度估计（在对齐之后执行）。
     # 用已估计重力方向，逐帧反投影真实深度并拟合低处水平地面，
     # 再把每个有效深度帧匹配到原始 VGGT 轨迹对应帧，用该帧对齐后的相机高度求尺度。
-    depth_unit_scale: 1.0
+    # null 自动读取解码后数组的单位元数据。缺少单位时必须显式填写；与元数据冲突会拒绝估计。
+    # 米=1.0，毫米=0.001；不能再次应用 Zarr 存储 codec 的量化倍率。
+    depth_unit_scale: null
+    # 所有深度/质量数组共享的已解压时间块 LRU 上限（MiB，不含 codec 临时内存）。
+    # 一组活动时间块超过上限时不读取，报告需增加预算或上游按时间重新分块。
+    depth_cache_mb: 512
+    # 补充设备特殊无效值，按 Zarr 解码后、换算成米之前的数值填写。
+    # 自动合并元数据 invalid_depth_value(s)/_FillValue/missing_value；不默认猜测 65535。
+    depth_invalid_values: []
+    # 不假设室内/室外测距范围。已知设备有效测距范围时显式填米值。
+    # null 只预过滤非有限/非正值和质量掩码；水平面成簇后再做簇内 MAD 去异常。
+    depth_min_m: null
+    depth_max_m: null
+    # 可选同一 depth zarr 内、与 depth 同形状的数组；null 表示上游未提供。
+    # validity > 0；confidence >= 下方阈值；disparity > 最小有效视差（像素）。
+    depth_validity_array: null
+    depth_confidence_array: null
+    depth_confidence_min: 0.5
+    depth_disparity_array: null
+    depth_min_disparity_px: 0.0
+    depth_floor_max_abs_height_m: null
+    # 稀疏高度直方图：桶宽保持 3cm；只存非空桶，下面限制峰值查询的分块桶数。
+    # 内存随输入点数增长，不随最大/最小高度跨度增长。
+    depth_floor_max_histogram_bins: 4096
     # 真实地面只在少数帧出现时，增加时间覆盖率；同一候选簇按隐含尺度聚类。
-    depth_scale_num_samples: 64
+    depth_scale_num_samples: 96
     depth_scale_cluster_rel_tol: 0.08
     depth_scale_min_support_frames: 3
     depth_scale_local_window: 15
@@ -369,6 +404,11 @@ config: &body_mesh_config
     lower_body_reference_seed: 7819
     # Official soft guidance, including the world-wrist position weight.
     hamer_abspos_weight: 20.0
+    # Reference shoulder reach: spatial hand guidance fades to its minimum at 1.35x arm length.
+    # Finger pose guidance remains active; the reference shoulders never follow the solve.
+    hand_reachability_fade_ratio: 0.35
+    # Keep 5% of the original residual multiplier even for far-out-of-reach targets.
+    hand_reachability_min_weight: 0.05
     # LM iteration caps per call; official defaults are inner=5, post=20.
     # Full-step guidance: checked on demo9/10/12/15/18; avoid last-20-only foot regression.
     inner_max_iters: 2
@@ -419,6 +459,10 @@ config: &body_mesh_config
       enable_xla_caches: xla_gpu_per_fusion_autotune_cache_dir
       explain_cache_misses: false
       debug_log_modules: false
+      # Prepare the original executable with lower().compile(), without dummy solves.
+      # solve restores the legacy warmup for diagnostics; inference budgets are unchanged.
+      prewarm_guidance: true
+      warmup_mode: compile
 
   python_cache:
     redirect_pycache_to_tmp: false

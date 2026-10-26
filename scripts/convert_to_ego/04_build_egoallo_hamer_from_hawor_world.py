@@ -59,6 +59,17 @@ def iter_jsonl(path):
             if not line:
                 continue
             rec = json.loads(line)
+            hands = []
+            for source_hand in rec.get("hands", []):
+                hand = dict(source_hand)
+                for canonical, upstream in (
+                    ("world_keypoints_3d", "keypoints_3d"),
+                    ("world_mesh_vertices_3d", "mesh_vertices_3d"),
+                ):
+                    if hand.get(canonical) is None and upstream in hand:
+                        hand[canonical] = hand[upstream]
+                hands.append(hand)
+            rec["hands"] = hands
             rec["_line_no"] = line_no
             yield rec
 
@@ -236,17 +247,19 @@ def estimate_hawor_to_vggt_camera_rotation(records, min_soft_alpha=0.0, soft_alp
     dst = np.concatenate(dst_vecs, axis=0)
     H = src.T @ dst
     U, _, Vt = np.linalg.svd(H)
-    R_row = Vt.T @ U.T
-    if np.linalg.det(R_row) < 0.0:
+    # H uses row-wise points, so V U^T is the column-vector rotation.
+    # Its transpose is used only when applying it to row-wise points.
+    R_col = Vt.T @ U.T
+    if np.linalg.det(R_col) < 0.0:
         Vt[-1, :] *= -1.0
-        R_row = Vt.T @ U.T
+        R_col = Vt.T @ U.T
 
-    pred = src @ R_row
+    pred = src @ R_col.T
     rmse = float(np.sqrt(np.mean(np.sum((pred - dst) ** 2, axis=1))))
     src_norm = float(np.sqrt(np.mean(np.sum(src ** 2, axis=1))))
     dst_norm = float(np.sqrt(np.mean(np.sum(dst ** 2, axis=1))))
     scale = dst_norm / src_norm if src_norm > 1e-8 else float("nan")
-    R_col = validate_rotation_matrix(R_row.T, "estimated camera-frame rotation")
+    R_col = validate_rotation_matrix(R_col, "estimated camera-frame rotation")
     angle = np.degrees(
         np.arccos(np.clip((np.trace(R_col.astype(np.float64)) - 1.0) * 0.5, -1.0, 1.0))
     )
@@ -344,18 +357,32 @@ def infer_frame_ids_from_file(path, count):
     return [numbers[0]] if count == 1 else None
 
 
-def add_mano_record(mapping, side, frame_id, root_orient, hand_pose, betas):
+def add_mano_record(mapping, side, frame_id, root_orient, hand_pose, betas, source_track=None):
     mapping.setdefault((side, int(frame_id)), []).append({
         "mano_hand_global_orient": normalize_orient_array(root_orient),
         "mano_hand_pose": normalize_pose_array(hand_pose),
         "mano_hand_betas": normalize_betas(betas),
+        "source_track": source_track,
     })
 
 
 @lru_cache(maxsize=2)
 def load_mano_layer(path, side):
     from smplx import MANOLayer
-    return MANOLayer(str(path), is_rhand=side == "right", flat_hand_mean=True).eval()
+    layer = MANOLayer(str(path), is_rhand=side == "right", flat_hand_mean=True).eval()
+    if side == "left":
+        right_path = Path(path).with_name("MANO_RIGHT.pkl")
+        if right_path.is_file():
+            right = load_mano_layer(str(right_path), "right")
+            left_x = layer.shapedirs[:, 0, :].detach().cpu().numpy()
+            right_x = right.shapedirs[:, 0, :].detach().cpu().numpy()
+            # Some MANO_LEFT releases retained the right-hand X shape basis.
+            # Mirror it only when the paired models identify that known bug;
+            # already corrected or unrelated bases must remain untouched.
+            if (left_x.shape == right_x.shape and np.linalg.norm(right_x) > 0
+                    and np.linalg.norm(left_x - right_x) <= 1e-3 * np.linalg.norm(right_x)):
+                layer.shapedirs[:, 0, :] *= -1
+    return layer
 
 
 def select_mano_record(mapping, side, frame_id, keypoints_cam=None, mano_path=None):
@@ -478,8 +505,116 @@ def load_cam_space_dirs(left_dir, right_dir, frame_key):
                 betas = rec.get("betas", pick_first_key(rec, ["init_betas", "betas", "mano_hand_betas"]))
                 if frame_id is None or root is None or pose is None or betas is None:
                     continue
-                add_mano_record(mapping, side, frame_id, root, pose, betas)
+                add_mano_record(mapping, side, frame_id, root, pose, betas, str(path))
     return mapping
+
+
+def load_mano_timeline(path, frame_key="frame_id"):
+    """Read the original camera timebase, before 5 Hz -> 30 Hz resampling."""
+    import pandas as pd
+
+    table = pd.read_parquet(path)
+    id_column = "source_frame_idx" if frame_key == "src_frame_id" else "frame_id"
+    required = {id_column, "timestamp_ns", "T_world_from_camera"}
+    if not required.issubset(table.columns):
+        raise ValueError(f"MANO timeline {path} requires columns {sorted(required)}")
+    table = table.sort_values("timestamp_ns")
+    times = table.timestamp_ns.to_numpy(dtype=np.int64)
+    ids = table[id_column].to_numpy(dtype=np.int64)
+    if not len(times) or np.any(np.diff(times) <= 0) or len(np.unique(ids)) != len(ids):
+        raise ValueError("MANO timeline must have unique frame IDs and increasing timestamps")
+    rotations = np.stack([np.asarray(x, dtype=np.float64).reshape(4, 4)[:3, :3]
+                          for x in table.T_world_from_camera])
+    if not np.isfinite(rotations).all():
+        raise ValueError("Non-finite source camera rotations in MANO timeline")
+    return dict(times_ns=times, frame_ids=ids, camera_rotations=rotations)
+
+
+def discover_mano_timeline(left_dir, right_dir):
+    """Only auto-discover the original camera table beside a cam_space directory."""
+    paths = {Path(directory).parent.parent / "camera.parquet"
+             for directory in (left_dir, right_dir) if directory is not None
+             and Path(directory).parent.name == "cam_space"}
+    paths = {path.resolve() for path in paths if path.is_file()}
+    if len(paths) > 1:
+        raise ValueError("Left and right MANO directories refer to different camera timelines")
+    return next(iter(paths)) if paths else None
+
+
+def interpolate_rotations(a, b, fraction):
+    """Shortest-arc rotation interpolation, including a stack of finger joints."""
+    from scipy.spatial.transform import Rotation
+
+    shape = np.shape(a)
+    ra = Rotation.from_matrix(np.asarray(a).reshape(-1, 3, 3))
+    rb = Rotation.from_matrix(np.asarray(b).reshape(-1, 3, 3))
+    relative = (ra.inv() * rb).as_rotvec()
+    return (ra * Rotation.from_rotvec(relative * fraction)).as_matrix().reshape(shape).astype(np.float32)
+
+
+def select_mano_at_timestamp(mapping, side, timestamp_ns, timeline, *,
+                             keypoints_cam=None, mano_path=None,
+                             R_vggtcam_haworcam=None, R_world_target_cam=None):
+    """Match source MANO by time, never by a resampled frame number.
+
+    Interpolate only adjacent source camera frames from the same hand chunk.
+    No extrapolation or filling missing MANO anchors is permitted. Global hand
+    orientations are interpolated in world coordinates, then returned in the
+    target HaWoR-camera convention expected by the existing converter.
+    Source anchors allow 1 ns timestamp rounding tolerance.
+    """
+    times = timeline["times_ns"]
+    position = int(np.searchsorted(times, timestamp_ns))
+    if position < len(times) and abs(int(times[position]) - timestamp_ns) <= 1:
+        lower = upper = position
+    elif position > 0 and abs(int(times[position - 1]) - timestamp_ns) <= 1:
+        lower = upper = position - 1
+    elif position == 0 or position == len(times):
+        return None
+    else:
+        lower, upper = position - 1, position
+        # An irregular timeline must not silently bridge missing source frames.
+        nominal_period = float(np.median(np.diff(times)))
+        if times[upper] - times[lower] > 1.5 * nominal_period:
+            return None
+    first = select_mano_record(mapping, side, timeline["frame_ids"][lower], keypoints_cam, mano_path)
+    last = (first if lower == upper else select_mano_record(
+        mapping, side, timeline["frame_ids"][upper], keypoints_cam, mano_path))
+    if first is None or last is None:
+        return None
+    if lower != upper and first.get("source_track") != last.get("source_track"):
+        return None
+    fraction = 0. if lower == upper else (timestamp_ns - times[lower]) / float(times[upper] - times[lower])
+    camera_change = np.eye(3) if R_vggtcam_haworcam is None else np.asarray(R_vggtcam_haworcam)
+    target_camera = (timeline["camera_rotations"][lower] if R_world_target_cam is None
+                     else np.asarray(R_world_target_cam))
+    first_world = timeline["camera_rotations"][lower] @ camera_change @ first["mano_hand_global_orient"]
+    last_world = timeline["camera_rotations"][upper] @ camera_change @ last["mano_hand_global_orient"]
+    root = camera_change.T @ target_camera.T @ interpolate_rotations(first_world, last_world, fraction)
+    return {
+        "mano_hand_global_orient": root.astype(np.float32),
+        "mano_hand_pose": interpolate_rotations(first["mano_hand_pose"], last["mano_hand_pose"], fraction),
+        "mano_hand_betas": ((1. - fraction) * first["mano_hand_betas"]
+                            + fraction * last["mano_hand_betas"]).astype(np.float32),
+        "source_track": first.get("source_track"),
+    }
+
+
+def validate_hand_records(records, timestamp_map):
+    """Require hand frame IDs and timestamps to use the target camera timebase."""
+    for rec in records:
+        frame_id = int(rec["frame_id"])
+        if frame_id not in timestamp_map:
+            raise KeyError(f"frame_id {frame_id} not found in timestamps table")
+        target_ns = int(timestamp_map[frame_id]["timestamp_ns"])
+        if "timestamp_ns" in rec:
+            record_ns = int(rec["timestamp_ns"])
+        elif "timestamp" in rec:
+            record_ns = int(round(float(rec["timestamp"]) * 1e9))
+        else:
+            raise ValueError("Hand input requires a timestamp for every record")
+        if abs(record_ns - target_ns) > 1:
+            raise ValueError(f"Hand input timestamp mismatch at frame_id={frame_id}")
 
 
 def make_placeholder_mano(keypoints_cam, side):
@@ -620,13 +755,10 @@ def main():
     parser.add_argument("--cam-space-right-dir", type=Path, default=None)
     parser.add_argument("--mano-frame-key", default="src_frame_id")
     parser.add_argument(
-        "--mano-lookup-field",
-        choices=("frame_id", "src_frame_id"),
-        default="src_frame_id",
-        help=(
-            "Which id is used to look up MANO records loaded from --cam-space-left-dir/--cam-space-right-dir. "
-            "Use frame_id if those JSON files are indexed by extracted frame ids; use src_frame_id if they are indexed by original video frames."
-        ),
+        "--mano-timeline-parquet", type=Path, default=None,
+        help="Original camera.parquet mapping cam_space frame IDs to episode timestamps; "
+             "automatically discovered beside cam_space when available. Interpolates MANO "
+             "only within valid source chunks, without changing input wrist positions.",
     )
     parser.add_argument(
         "--skip-missing-mano",
@@ -699,12 +831,13 @@ def main():
         print("Missing per-frame MANO detections will become wrist-only constraints when wrist/keypoints are valid.")
     print(
         f"MANO records will be loaded with mano_frame_key={args.mano_frame_key!r} "
-        f"and looked up by mano_lookup_field={args.mano_lookup_field!r}."
+        "and matched by episode timestamp."
     )
 
     poses = load_camera_poses(args.camera_poses_txt)
     timestamp_map = read_timestamps(args.timestamps_txt)
     records = list(iter_jsonl(args.prepared_hands_jsonl))
+    validate_hand_records(records, timestamp_map)
     has_explicit_soft_alpha = records_have_explicit_soft_alpha(records)
     if args.min_soft_alpha_to_keep < 0:
         if args.write_soft_weights:
@@ -742,6 +875,16 @@ def main():
         args.cam_space_right_dir,
         args.mano_frame_key,
     )
+    mano_timeline_path = args.mano_timeline_parquet or discover_mano_timeline(
+        args.cam_space_left_dir, args.cam_space_right_dir)
+    mano_timeline = (load_mano_timeline(mano_timeline_path, args.mano_frame_key)
+                     if mano_timeline_path is not None else None)
+    if mano_map and mano_timeline is None:
+        raise ValueError("MANO timestamp matching requires --mano-timeline-parquet or an auto-discovered "
+                         "source camera.parquet; resampled frame numbers cannot identify source MANO frames")
+    if mano_timeline is not None:
+        print(f"MANO records matched by episode timestamp using {mano_timeline_path}; "
+              "source frame numbers are not resampled frame numbers.")
     faces_left = load_faces(args.mano_faces_left_npy, args.mano_left_pkl, "left")
     faces_right = load_faces(args.mano_faces_right_npy, args.mano_right_pkl, "right")
 
@@ -822,7 +965,7 @@ def main():
             keypoints_world = require_points(hand, "world_keypoints_3d", context)
             verts_world = require_points(hand, "world_mesh_vertices_3d", context)
 
-            # World points are the canonical smoothed geometry. Reproject them
+            # World points are the canonical upstream geometry. Reproject them
             # together so keypoints and mesh cannot drift into different frames.
             keypoints_cam = world_points_to_camera(
                 keypoints_world,
@@ -833,12 +976,16 @@ def main():
             err = np.linalg.norm(keypoints_cam - keypoints_cam_input, axis=1)
             keypoint_consistency_errors.extend(err.tolist())
 
-            mano_lookup_id = frame_id if args.mano_lookup_field == "frame_id" else src_frame_id
-            mano = select_mano_record(
-                mano_map, side, mano_lookup_id,
+            selection_args = dict(
                 keypoints_cam=hand.get("hawor_camera_keypoints_3d"),
-                mano_path=args.mano_left_pkl if side == "left" else args.mano_right_pkl,
-            )
+                mano_path=args.mano_left_pkl if side == "left" else args.mano_right_pkl)
+            if mano_timeline is None:
+                mano = None
+            else:
+                mano = select_mano_at_timestamp(
+                    mano_map, side, timestamp_ns, mano_timeline, **selection_args,
+                    R_vggtcam_haworcam=R_vggtcam_haworcam,
+                    R_world_target_cam=T_world_cam[:3, :3])
             has_mano = mano is not None
             constraint_mode = "full"
             if mano is None:
@@ -850,7 +997,6 @@ def main():
                             {
                                 "side": side,
                                 "src_frame_id": src_frame_id,
-                                "mano_lookup_id": int(mano_lookup_id),
                                 "soft_alpha": soft_alpha,
                                 "skipped": True,
                                 "skip_reason": "missing_mano",
@@ -864,8 +1010,8 @@ def main():
                 )
                 if args.require_mano and not allow_interpolated_placeholder:
                     raise KeyError(
-                        f"Missing MANO params for side={side}, {args.mano_lookup_field}={mano_lookup_id}. "
-                        "Use --mano-lookup-field to choose frame_id/src_frame_id, pass matching cam-space MANO dirs, "
+                        f"Missing MANO params for side={side}, timestamp_ns={timestamp_ns}. "
+                        "Pass matching cam-space MANO dirs and their original camera timeline, "
                         "or disable --require-mano to downgrade valid wrist detections to wrist-only constraints."
                     )
                 placeholder_keypoints = optional_points(
@@ -911,7 +1057,6 @@ def main():
                     {
                         "side": side,
                         "src_frame_id": src_frame_id,
-                        "mano_lookup_id": int(mano_lookup_id),
                         "soft_alpha": soft_alpha,
                         "constraint_weight": hand.get("constraint_weight"),
                         "visualization_alpha": hand.get("visualization_alpha"),
@@ -964,7 +1109,6 @@ def main():
         "T_device_cam": np.asarray(args.T_cpf_cam, dtype=np.float32),
         "T_cpf_cam": np.asarray(args.T_cpf_cam, dtype=np.float32),
     }
-
     args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output_pkl, "wb") as f:
         pickle.dump(outputs, f)

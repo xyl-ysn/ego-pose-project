@@ -199,36 +199,99 @@ def print_motion_diagnostics(body_model, Ts_world_cpf, Ts_world_root, traj, floo
     )
 
 
-def add_object_assets(server, objects_parquet: Path, object_mesh: Path) -> None:
+def object_rows_by_timestep(objects, timestamps):
+    """Match object poses to the motion clock, not renumbered motion frames.
+
+    Missing/invalid observations stay absent; do not leave a stale object pose
+    on screen. At most one observation per track and motion frame is shown.
+    """
+    if timestamps is None:
+        raise ValueError("Object playback requires motion timestamps or timestamps_ns")
+    times = np.asarray(timestamps, dtype=np.float64)
+    if (times.ndim != 1 or not len(times) or not np.isfinite(times).all()
+            or np.any(np.diff(times) <= 0)):
+        raise ValueError("Motion timestamps must be finite and strictly increasing")
+    if "timestamp_ns" in objects.columns:
+        object_times = objects["timestamp_ns"].to_numpy(dtype=np.float64) / 1e9
+    elif "timestamp" in objects.columns:
+        object_times = objects["timestamp"].to_numpy(dtype=np.float64)
+    else:
+        raise ValueError("Object playback requires timestamp_ns or timestamp in parquet")
+    if "coordinate_system" in objects.columns and not objects["coordinate_system"].eq("egoallo_world").all():
+        raise ValueError("Object poses must use egoallo_world coordinates")
+    if "length_unit" in objects.columns and not objects["length_unit"].eq("meter").all():
+        raise ValueError("Object poses must use meters")
+
+    tolerance = float(np.median(np.diff(times)) * .51) if len(times) > 1 else 1e-6
+    matches = {}
+    for timestamp, (_, row) in zip(object_times, objects.iterrows()):
+        if not np.isfinite(timestamp) or not bool(row.get("valid", True)):
+            continue
+        matrix = row.get("T_world_from_object")
+        if matrix is None:
+            continue
+        try:
+            T = np.asarray(matrix.tolist() if isinstance(matrix, np.ndarray) else matrix,
+                           dtype=np.float64).reshape(4, 4)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(T).all() or not np.allclose(T[3], [0, 0, 0, 1], atol=1e-6):
+            continue
+        index = int(np.searchsorted(times, timestamp))
+        candidates = [i for i in (index - 1, index) if 0 <= i < len(times)]
+        index = min(candidates, key=lambda i: abs(times[i] - timestamp))
+        distance = abs(times[index] - timestamp)
+        if distance > tolerance:
+            continue
+        track = str(row.get("track_id") or "object")
+        confidence = float(row.get("confidence", 0.))
+        confidence = confidence if np.isfinite(confidence) else 0.
+        key = (index, track)
+        rank = (distance, -confidence)
+        if key not in matches or rank < matches[key][0]:
+            matches[key] = (rank, T)
+    return [(index, track, value[1]) for (index, track), value in sorted(matches.items())]
+
+
+def add_object_assets(server, objects_parquet: Path, object_mesh: Path, timestamps) -> int:
     import pandas as pd
+    from urllib.parse import quote
 
     objects = pd.read_parquet(objects_parquet)
+    matches = object_rows_by_timestep(objects, timestamps)
     scene = trimesh.load(object_mesh, force="scene")
 
     mesh_parts = []
-    for geometry in scene.geometry.values():
+    # Keep GLB node transforms and repeated instances of the same geometry.
+    for node in scene.graph.nodes_geometry:
+        transform, geometry_name = scene.graph[node]
+        geometry = scene.geometry[geometry_name]
         if isinstance(geometry, trimesh.Trimesh):
-            mesh_parts.append(geometry)
+            part = geometry.copy()
+            part.apply_transform(transform)
+            mesh_parts.append(part)
     if not mesh_parts:
         raise ValueError(f"No triangle mesh found in {object_mesh}")
 
     count = 0
-    for _, row in objects.iterrows():
-        matrix = row.get("T_world_from_object")
-        if matrix is None:
-            continue
-        T = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
-        for part in mesh_parts:
+    for timestep, track, T in matches:
+        for part_index, part in enumerate(mesh_parts):
             vertices = (T[:3, :3] @ np.asarray(part.vertices, dtype=np.float64).T).T + T[:3, 3]
             server.scene.add_mesh_simple(
-                f"/objects/{row.get('track_id') or 'object'}/{int(row['frame'])}",
+                # vis_helpers toggles /timesteps/{t} atomically with the body.
+                # Children inherit visibility during playback, seeking and
+                # .viser recording without a separate, lagging animation loop.
+                f"/timesteps/{timestep}/objects/{quote(track, safe='')}/part_{part_index}",
                 vertices=vertices,
                 faces=np.asarray(part.faces),
                 color=(210, 140, 70),
                 flat_shading=False,
             )
         count += 1
-    print(f"[Objects] added {count} object meshes from {objects_parquet} + {object_mesh}")
+    print(f"[Objects] matched {count}/{len(objects)} poses to "
+          f"{len(set(i for i, _, _ in matches))}/{len(timestamps)} motion timesteps; "
+          "object visibility follows Playback/Timestep")
+    return count
 
 
 def main() -> None:
@@ -284,8 +347,6 @@ def main() -> None:
     os.chdir(egogvae_root)
     try:
         server = viser.ViserServer(host=args.host, port=args.port)
-        if objects_parquet is not None and object_mesh is not None:
-            add_object_assets(server, objects_parquet, object_mesh)
         loop_cb = visualize_traj_and_hand_detections(
             server,
             Ts_world_cpf=Ts_world_cpf,
@@ -298,6 +359,8 @@ def main() -> None:
             show_joints=bool(args.show_joints),
             playback_fps=playback_fps,
         )
+        if objects_parquet is not None and object_mesh is not None:
+            add_object_assets(server, objects_parquet, object_mesh, timestamps)
         print(f"Open the Viser viewer at http://{args.host}:{server.get_port()}", flush=True)
         while True:
             loop_cb()

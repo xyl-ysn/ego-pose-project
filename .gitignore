@@ -5,6 +5,7 @@ data/outputs/tmp/*
 data/outputs/thk/*
 jax_cache/*
 tests/outputs/*
+model/*
 
 # 第三方库源码
 third_party/*

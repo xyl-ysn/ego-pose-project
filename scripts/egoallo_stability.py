@@ -99,25 +99,43 @@ def foot_vertex_ids(model):
             for ids in ([7, 10], [8, 11])]
 
 
-def foot_bottom(pose, side_ids):
+def _foot_bottom_evaluator(shaped, side_ids):
+    """Prepare fixed geometry once; retain the original LBS operation order.
+
+    Solvers evaluate the same shaped feet hundreds of times. Keeping only the
+    constant slices outside CUDA capture avoids replaying their allocation and
+    indexing kernels. A broadcast scalar supplies homogeneous ones without a
+    separate [frames, foot vertices, joints, 1] allocation.
+    """
     ids = torch.cat(side_ids)
-    shaped = pose.shaped_model
     model = shaped.body_model
-    rotation = SO3(pose.local_quats).as_matrix()
-    verts = shaped.verts_zero[..., ids, :] + fncsmpl.einsum(model.posedirs[ids],
-        (rotation - torch.eye(3, device=rotation.device, dtype=rotation.dtype)).flatten(-3),
-        '... verts j joints_times_9, ... joints_times_9 -> ... verts j')
-    root, joints = pose.T_world_root, pose.Ts_world_joint
-    # Build the used 3x4 matrices on-device; SE3.as_matrix copies a CPU constant.
-    root_matrix = torch.cat([SO3(root[..., :4]).as_matrix(), root[..., 4:, None]], -1)
-    joint_matrix = torch.cat([SO3(joints[..., :4]).as_matrix(), joints[..., 4:, None]], -1)
     cat = fncsmpl.broadcasting_cat
-    world = fncsmpl.einsum(cat([root_matrix[..., None, :, :], joint_matrix], dim=-3), model.weights[ids],
-        cat([verts[..., :, None, :] - cat([shaped.joints_zero.new_zeros(3), shaped.joints_zero[..., None, :, :]], dim=-2),
-             verts.new_ones((*verts.shape[:-1], 1 + shaped.joints_zero.shape[-2], 1))], dim=-1),
-        '... joints_p1 i j, verts joints_p1, ... verts joints_p1 j -> ... verts i')
+    verts_zero, posedirs, weights = shaped.verts_zero[..., ids, :], model.posedirs[ids], model.weights[ids]
+    joints_zero = cat([shaped.joints_zero.new_zeros(3), shaped.joints_zero[..., None, :, :]], dim=-2)
+    eye = torch.eye(3, device=verts_zero.device, dtype=verts_zero.dtype)
+    one = verts_zero.new_ones(1)
     split = len(side_ids[0])
-    return torch.stack([world[..., :split, 2].amin(-1), world[..., split:, 2].amin(-1)], -1)
+
+    def evaluate(pose):
+        rotation = SO3(pose.local_quats).as_matrix()
+        verts = verts_zero + fncsmpl.einsum(posedirs,
+            (rotation - eye).flatten(-3),
+            '... verts j joints_times_9, ... joints_times_9 -> ... verts j')
+        root, joints = pose.T_world_root, pose.Ts_world_joint
+        # Build the used 3x4 matrices on-device; SE3.as_matrix copies a CPU constant.
+        root_matrix = torch.cat([SO3(root[..., :4]).as_matrix(), root[..., 4:, None]], -1)
+        joint_matrix = torch.cat([SO3(joints[..., :4]).as_matrix(), joints[..., 4:, None]], -1)
+        world = fncsmpl.einsum(cat([root_matrix[..., None, :, :], joint_matrix], dim=-3), weights,
+            cat([verts[..., :, None, :] - joints_zero,
+                 one.expand(*verts.shape[:-1], 1 + shaped.joints_zero.shape[-2], 1)], dim=-1),
+            '... joints_p1 i j, verts joints_p1, ... verts joints_p1 j -> ... verts i')
+        return torch.stack([world[..., :split, 2].amin(-1), world[..., split:, 2].amin(-1)], -1)
+
+    return evaluate
+
+
+def foot_bottom(pose, side_ids):
+    return _foot_bottom_evaluator(pose.shaped_model, side_ids)(pose)
 
 
 def contact_probabilities(data, device):
@@ -174,13 +192,22 @@ def smooth_body(data, model, device, max_degrees=5.0):
     return result
 
 
-def _filter_grounding_correction(delta, sigma):
+def _grounding_kernel(delta, sigma):
     if sigma <= 0 or len(delta) == 1:
-        return delta
+        return None
     radius = max(1, int(round(3 * sigma)))
     x = torch.arange(-radius, radius + 1, device=delta.device, dtype=delta.dtype)
     kernel = torch.exp(-.5 * (x / sigma).square())
     kernel /= kernel.sum()
+    return kernel
+
+
+def _filter_grounding_correction(delta, sigma, kernel=None):
+    if sigma <= 0 or len(delta) == 1:
+        return delta
+    if kernel is None:
+        kernel = _grounding_kernel(delta, sigma)
+    radius = (len(kernel) - 1) // 2
     channels = delta.reshape(len(delta), -1).T[None]
     return torch.nn.functional.conv1d(torch.nn.functional.pad(channels, (radius, radius), mode='replicate'),
         kernel.expand(channels.shape[1], 1, -1), groups=channels.shape[1])[0].T.reshape_as(delta)
@@ -222,40 +249,47 @@ def ground_below_chest(base, model, device, contact, spine_limit=8., leg_limit=1
     original_feet = before.Ts_world_joint[:, [6, 7, 9, 10], 4:]
     original_foot_rotation = SO3(before.Ts_world_joint[:, [6, 7, 9, 10], :4]).normalize()
     foot_ids = foot_vertex_ids(model)
+    evaluate_bottom = _foot_bottom_evaluator(before.shaped_model, foot_ids)
+    original_root_rotation_inverse = SO3(original_root[:, :4]).normalize().inverse()
+    original_foot_rotation_inverse = original_foot_rotation.inverse()
     rate = tensor((1 / 30) / np.diff(times))[:, None, None]
     sigma = correction_sigma_seconds / float(np.median(np.diff(times))) if len(times) > 1 else 0.
     limits = tensor([leg_limit] * 8 + [spine_limit] * 3)[None, :, None] * np.pi / 180
     delta = torch.nn.Parameter(torch.zeros(len(q0), len(ids), 3, device=device))
+    correction_kernel = _grounding_kernel(delta, sigma)
+    original_corrected_quats = SO3(q0[:, ids])
     optimizer = torch.optim.Adam([delta], lr=.012)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, iterations, eta_min=.0003)
     best, saved, started = float('inf'), delta.detach().clone(), time.perf_counter()
     pair = torch.minimum(contact[:-1], contact[1:])
+    contact_weight = contact.sum().clamp(min=1)
+    pair_weight = pair.sum().clamp(min=1)
     history = []
 
     def current():
-        correction = _filter_grounding_correction(delta, sigma)
+        correction = _filter_grounding_correction(delta, sigma, correction_kernel)
         q = q0.clone()
-        q[:, ids] = (SO3(q0[:, ids]) @ SO3.exp(correction)).wxyz
+        q[:, ids] = (original_corrected_quats @ SO3.exp(correction)).wxyz
         return pose_with_fixed_chest(before, q), correction
 
-    def weighted(value, weight):
-        return (value * weight).sum() / weight.sum().clamp(min=1)
+    def weighted(value, weight, total):
+        return (value * weight).sum() / total
 
     def objective():
         p, correction = current()
         feet = p.Ts_world_joint[:, support_ids, 4:]
-        bottom = foot_bottom(p, foot_ids) - floor_z
+        bottom = evaluate_bottom(p) - floor_z
         root_delta = p.T_world_root[:, 4:] - original_root[:, 4:]
-        root_angle = (SO3(original_root[:, :4]).normalize().inverse() @ SO3(p.T_world_root[:, :4]).normalize()).log()
+        root_angle = (original_root_rotation_inverse @ SO3(p.T_world_root[:, :4]).normalize()).log()
         angular_step = (SO3(p.local_quats[:-1, ids]).normalize().inverse() @ SO3(p.local_quats[1:, ids]).normalize()).log()
-        foot_angle = (original_foot_rotation.inverse() @ SO3(p.Ts_world_joint[:, support_ids, :4]).normalize()).log().norm(dim=-1)
+        foot_angle = (original_foot_rotation_inverse @ SO3(p.Ts_world_joint[:, support_ids, :4]).normalize()).log().norm(dim=-1)
         return dict(
             foot_xy_guard=1000000 * torch.relu((feet[..., :2] - original_feet[..., :2]).norm(dim=-1) - foot_xy_limit * .8).square().mean(),
             foot_angle_guard=1000000 * torch.relu(foot_angle - np.deg2rad(foot_angle_limit) * .8).square().mean(),
             penetration=60000 * torch.relu(.001 - bottom).square().mean(),
-            contact_height=10000 * weighted(bottom.square(), contact),
+            contact_height=10000 * weighted(bottom.square(), contact, contact_weight),
             own_foot_xy=3000 * (feet[..., :2] - original_feet[..., :2]).square().mean(),
-            foot_skating=20000 * weighted((torch.diff(feet[:, 2:], dim=0) * rate).square().sum(-1), pair),
+            foot_skating=20000 * weighted((torch.diff(feet[:, 2:], dim=0) * rate).square().sum(-1), pair, pair_weight),
             foot_acceleration=15000 * temporal_weight_scale * safe_mean(torch.diff(torch.diff(feet, dim=0) * rate, dim=0).square()),
             angular_acceleration=800 * temporal_weight_scale * safe_mean(torch.diff(angular_step * rate, dim=0).square()),
             root_acceleration=50000 * temporal_weight_scale * safe_mean(torch.diff(torch.diff(p.T_world_root[:, 4:], dim=0) * rate[:, 0], dim=0).square()),
@@ -339,12 +373,20 @@ def solve_legs(data, model, device, contact, timestamps, floor_z=0.0, iterations
         raw_pos = raw_pose.Ts_world_joint[..., 4:]
         pair = torch.minimum(contact[1:], contact[:-1])
     with torch.no_grad():
-        support_q = tensor(np.concatenate([support_reference[k][0] for k in ('body_quats', 'left_hand_quats', 'right_hand_quats')], 1))
-        support_pose = model.with_shape(tensor(support_reference['betas'][0])).with_pose(tensor(support_reference['Ts_world_root'][0]), support_q)
+        if support_reference is data:
+            support_pose = raw_pose
+        else:
+            support_q = tensor(np.concatenate([support_reference[k][0] for k in ('body_quats', 'left_hand_quats', 'right_hand_quats')], 1))
+            # Grounding preserves betas. Reuse the identical per-frame shape
+            # instead of allocating a second full [frames, vertices, 3] body.
+            support_shaped = shaped if np.array_equal(data['betas'], support_reference['betas']) else model.with_shape(tensor(support_reference['betas'][0]))
+            support_pose = support_shaped.with_pose(tensor(support_reference['Ts_world_root'][0]), support_q)
         support_xy = support_pose.Ts_world_joint[:, [6, 7, 9, 10], 4:6]
         support_rotation = SO3(support_pose.Ts_world_joint[:, [6, 7, 9, 10], :4]).normalize()
     if iterations <= 0 or max_correction_degrees == 0:
         return dict(data), {"enabled": False}
+    evaluate_bottom = _foot_bottom_evaluator(shaped, side_ids)
+    support_rotation_inverse = support_rotation.inverse()
     dt = tensor(np.diff(timestamps))
     rate = (1.0 / 30.0) / dt[:, None, None]
     delta = torch.nn.Parameter(torch.zeros((len(root), len(LEGS), 3), device=device))
@@ -354,28 +396,31 @@ def solve_legs(data, model, device, contact, timestamps, floor_z=0.0, iterations
     started = time.perf_counter()
     leg_ids = _joint_ids(tuple(LEGS), qraw.device)
     support_ids = _joint_ids((6, 7, 9, 10), qraw.device)
+    original_leg_quats = SO3(qraw[:, leg_ids])
+    contact_weight = contact.sum().clamp(min=1)
+    pair_weight = pair.sum().clamp(min=1)
 
-    def weighted(value, weights):
-        return (value * weights).sum() / weights.sum().clamp(min=1)
+    def weighted(value, weights, total):
+        return (value * weights).sum() / total
 
     def current():
-        pose = pose_with_legs(raw_pose, (SO3(qraw[:, leg_ids]) @ SO3.exp(delta)).wxyz)
+        pose = pose_with_legs(raw_pose, (original_leg_quats @ SO3.exp(delta)).wxyz)
         return pose.local_quats, pose
 
     def objective():
         q, pose = current()
-        bottom = foot_bottom(pose, side_ids) - floor_z
+        bottom = evaluate_bottom(pose) - floor_z
         feet = pose.Ts_world_joint[:, 9:11, 4:]
         angular_step = (SO3(q[:-1, leg_ids]).inverse() @ SO3(q[1:, leg_ids])).log()
         support_change = (pose.Ts_world_joint[:, support_ids, 4:6] - support_xy).norm(dim=-1)
-        support_angle = (support_rotation.inverse() @ SO3(pose.Ts_world_joint[:, support_ids, :4]).normalize()).log().norm(dim=-1)
+        support_angle = (support_rotation_inverse @ SO3(pose.Ts_world_joint[:, support_ids, :4]).normalize()).log().norm(dim=-1)
         return {
             'foot_xy_guard': 1000000 * torch.relu(support_change - foot_xy_limit * .8).square().mean(),
             'foot_angle_guard': 1000000 * torch.relu(support_angle - np.deg2rad(foot_angle_limit) * .8).square().mean(),
             'pose_prior': delta.square().sum(-1).mean(),
             'penetration': 3000 * torch.relu(-bottom).square().mean(),
-            'contact_height': 900 * weighted(bottom.square(), contact),
-            'foot_skating': 30000 * weighted((torch.diff(feet, dim=0) * rate).square().sum(-1), pair),
+            'contact_height': 900 * weighted(bottom.square(), contact, contact_weight),
+            'foot_skating': 30000 * weighted((torch.diff(feet, dim=0) * rate).square().sum(-1), pair, pair_weight),
             'own_foot_xy_prior': 1000 * (feet[..., :2] - raw_pos[:, 9:11, :2]).square().sum(-1).mean(),
             'angular_acceleration': 1200 * safe_mean(torch.diff(angular_step * rate, dim=0).square()),
             'foot_acceleration': 15000 * safe_mean(torch.diff(torch.diff(feet, dim=0) * rate, dim=0).square()),

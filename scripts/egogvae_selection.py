@@ -7,6 +7,7 @@ used by the production EgoGVAE runner and can also be reused by diagnostics.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from typing import Any
 
 import numpy as np
@@ -117,6 +118,79 @@ def transition_cost(
     }
 
 
+def _batched_discrepancy(
+    a_quats: np.ndarray, b_quats: np.ndarray,
+    a_positions: np.ndarray, b_positions: np.ndarray,
+    a_contacts: np.ndarray, b_contacts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The scalar discrepancy formulas, with an additional independent time axis.
+
+    Quaternion reductions remain float64; FK/contact reductions retain their
+    original float32 dtype. Promote only their scalar results, as float() does
+    in the scalar functions, before multiplying by the selection weights.
+    """
+    qa = np.ascontiguousarray(a_quats[:, ROT_TRANSITION_JOINTS], dtype=np.float64)
+    qb = np.ascontiguousarray(b_quats[:, ROT_TRANSITION_JOINTS], dtype=np.float64)
+    denom = np.clip(np.linalg.norm(qa, axis=-1) * np.linalg.norm(qb, axis=-1), 1e-8, None)
+    dots = np.abs(np.sum(qa * qb, axis=-1) / denom)
+    angles = np.degrees(2.0 * np.arccos(np.clip(dots, -1.0, 1.0)))
+    rotation = np.max(angles, axis=-1)
+    foot_delta = np.ascontiguousarray(a_positions[:, FOOT_JOINTS, 4:7] - b_positions[:, FOOT_JOINTS, 4:7])
+    foot = np.linalg.norm(foot_delta, axis=-1).max(axis=-1).astype(np.float64)
+    contact = np.max(np.abs(a_contacts[:, FOOT_JOINTS] - b_contacts[:, FOOT_JOINTS]), axis=-1).astype(np.float64)
+    return rotation, foot, contact
+
+
+def _pair_cost_cache(windows, starts, pose_arrays, fk, contact_probs, params):
+    """Compute each overlapping window pair once, including gate relaxations.
+
+    Each batch spans at most one window, so storage scales with window overlap,
+    not with the square of the total frame count. Lists keep the original Python
+    float arithmetic in the sequential Viterbi recurrence below.
+    """
+    cache = {}
+    max_length = max(windows[ws]["end"] - windows[ws]["start"] for ws in starts)
+    for pws in starts:
+        first = bisect_right(starts, windows[pws]["start"] + 1 - max_length)
+        last = bisect_left(starts, windows[pws]["end"] + 1)
+        for ws in starts[first:last]:
+            lo = max(windows[pws]["start"] + 1, windows[ws]["start"])
+            hi = min(windows[pws]["end"] + 1, windows[ws]["end"])
+            if hi <= lo:
+                continue
+            previous = slice(lo - 1 - pws, hi - 1 - pws)
+            current = slice(lo - ws, hi - ws)
+            rot, foot, contact = _batched_discrepancy(
+                pose_arrays[pws][previous], pose_arrays[ws][current],
+                fk[pws][previous], fk[ws][current],
+                contact_probs[pws][previous], contact_probs[ws][current])
+            temporal = (rot * float(params["rotation_weight"])
+                        + foot * float(params["foot_position_weight"])
+                        + contact * float(params["contact_jump_weight"]))
+            extra = np.full(hi - lo, np.inf, dtype=np.float64)
+            sf_rot = np.zeros(hi - lo, dtype=np.float64)
+            sf_foot = np.zeros(hi - lo, dtype=np.float64)
+            if pws == ws:
+                extra.fill(0.0)
+            else:
+                # Switching requires both windows to cover the current frame.
+                count = min(hi, windows[pws]["end"]) - lo
+                if count > 0:
+                    previous_same = slice(lo - pws, lo + count - pws)
+                    current_same = slice(lo - ws, lo + count - ws)
+                    rot, foot, contact = _batched_discrepancy(
+                        pose_arrays[pws][previous_same], pose_arrays[ws][current_same],
+                        fk[pws][previous_same], fk[ws][current_same],
+                        contact_probs[pws][previous_same], contact_probs[ws][current_same])
+                    extra[:count] = (float(params["switch_penalty"])
+                                     + float(params["same_frame_rotation_weight"]) * rot
+                                     + float(params["same_frame_foot_weight"]) * foot
+                                     + float(params["same_frame_contact_weight"]) * contact)
+                    sf_rot[:count], sf_foot[:count] = rot, foot
+            cache[pws, ws] = (lo, temporal.tolist(), extra.tolist(), sf_rot.tolist(), sf_foot.tolist())
+    return cache
+
+
 def build_blend_regions(
     switches: list[dict[str, Any]],
     windows: dict[int, dict[str, Any]],
@@ -182,12 +256,9 @@ def select_and_blend(
     center = float(params["window_pos_center"])
     trusted_lo = float(params["window_pos_trusted_lo"])
     trusted_hi = float(params["window_pos_trusted_hi"])
-    switch_penalty = float(params["switch_penalty"])
-    same_frame_rotation_weight = float(params["same_frame_rotation_weight"])
-    same_frame_foot_weight = float(params["same_frame_foot_weight"])
-    same_frame_contact_weight = float(params["same_frame_contact_weight"])
     rotation_threshold = float(params["switch_rotation_threshold_deg"])
     foot_threshold = float(params["switch_foot_threshold_m"])
+    pair_costs = _pair_cost_cache(windows, starts, pose_arrays, fk, contact_probs, params)
 
     def run_dp(rot_thresh: float | None, foot_thresh: float | None) -> tuple[list[list[float]], list[list[int]]]:
         costs: list[list[float]] = []
@@ -198,8 +269,6 @@ def select_and_blend(
             for cand in candidates[frame]:
                 ws = cand["ws"]
                 local = cand["local"]
-                quats = pose_arrays[ws][local]
-                positions = fk[ws][local]
                 contacts = contact_probs[ws][local]
                 unary = (
                     float(params["window_pos_weight"]) * window_position_cost(local, center, trusted_lo, trusted_hi)
@@ -214,47 +283,15 @@ def select_and_blend(
                 best_prev = -1
                 for prev_idx, prev_cand in enumerate(candidates[frame - 1]):
                     pws = prev_cand["ws"]
-                    plocal = prev_cand["local"]
-                    pquats = pose_arrays[pws][plocal]
-                    ppositions = fk[pws][plocal]
-                    pcontacts = contact_probs[pws][plocal]
-                    trans = transition_cost(
-                        pquats,
-                        quats,
-                        ppositions,
-                        positions,
-                        pcontacts,
-                        contacts,
-                        SO3=SO3,
-                        rotation_weight=float(params["rotation_weight"]),
-                        foot_position_weight=float(params["foot_position_weight"]),
-                        contact_jump_weight=float(params["contact_jump_weight"]),
-                    )
-                    temporal_cost = trans["rotation"] + trans["foot_position"] + trans["contact"]
-                    if pws == ws:
-                        extra_cost = 0.0
-                    else:
-                        a_local = frame - pws
-                        if a_local < 0 or a_local >= windows[pws]["end"] - windows[pws]["start"]:
-                            extra_cost = float("inf")
-                        else:
-                            aq = pose_arrays[pws][a_local]
-                            ap = fk[pws][a_local]
-                            ac = contact_probs[pws][a_local]
-                            sf = same_frame_discrepancy(aq, quats, ap, positions, ac, contacts, SO3=SO3)
-                            gated = (
-                                (rot_thresh is not None and sf["rotation_deg_max"] > rot_thresh)
-                                or (foot_thresh is not None and sf["foot_position_m_max"] > foot_thresh)
-                            )
-                            if gated:
-                                extra_cost = float("inf")
-                            else:
-                                extra_cost = (
-                                    switch_penalty
-                                    + same_frame_rotation_weight * sf["rotation_deg_max"]
-                                    + same_frame_foot_weight * sf["foot_position_m_max"]
-                                    + same_frame_contact_weight * sf["contact_diff_max"]
-                                )
+                    offset, temporal, extra, sf_rot, sf_foot = pair_costs[pws, ws]
+                    item = frame - offset
+                    temporal_cost = temporal[item]
+                    extra_cost = extra[item]
+                    if pws != ws and (
+                        (rot_thresh is not None and sf_rot[item] > rot_thresh)
+                        or (foot_thresh is not None and sf_foot[item] > foot_thresh)
+                    ):
+                        extra_cost = float("inf")
                     cand_cost = float("inf") if extra_cost == float("inf") else costs[frame - 1][prev_idx] + temporal_cost + extra_cost
                     if cand_cost < best_cost:
                         best_cost = cand_cost

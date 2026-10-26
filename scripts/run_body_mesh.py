@@ -24,6 +24,10 @@ sys.dont_write_bytecode = True
 SCRIPTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPTS_DIR.parent
 
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+from runtime_threads import BLAS_THREAD_ENV, preprocessing_env, thread_count
+
 CONVERT_TO_EGO_DIR = SCRIPTS_DIR / "convert_to_ego"
 ESMATEG_DIR = SCRIPTS_DIR / "esmateG"
 
@@ -45,6 +49,15 @@ SCRIPT_RUN_EGOGVAE = SCRIPTS_DIR / "05_run_egogvae_from_head.py"
 SCRIPT_RUN_EGOALLO_REFINE = SCRIPTS_DIR / "07_run_egoallo_refine_with_prior.py"
 FINAL_MOTION_NAME = "merged_smoothed_vis.npz"
 
+# Set CPU thread defaults in preprocessing child processes. The dedicated model
+# runners retain their inference environment and scope CPU operations separately.
+CPU_PREPROCESS_SCRIPTS = frozenset({
+    SCRIPT_01_CAMERA_POSES, SCRIPT_02_EXTRACT_HANDS, SCRIPT_03_STABILIZE_HANDS,
+    SCRIPT_EXTRACT_ROT, SCRIPT_04_BUILD_HAMER, SCRIPT_PREPARE_REAL_SENSOR,
+    SCRIPT_05_APPLY_SCALE, SCRIPT_ESTIMATE_GRAVITY, SCRIPT_APPLY_ALIGNMENT,
+    SCRIPT_VALIDATE_POSE_BEFORE_EGOGVAE,
+})
+
 
 @dataclass(frozen=True)
 class UpstreamInputs:
@@ -55,6 +68,7 @@ class UpstreamInputs:
     objects_parquet: Path
     object_meshes: tuple[Path, ...]
     hawor_hands_vggt_world: Path
+    hands_parquet: Path
     hawor_to_vggt_alignment: Path
     vggt_head_pose: Path
     scene_points_ply: Path
@@ -164,6 +178,7 @@ def _prepare_upstream_inputs(
         objects_parquet=objects_parquet,
         object_meshes=tuple(object_meshes),
         hawor_hands_vggt_world=hawor_hands_vggt_world,
+        hands_parquet=hands_parquet,
         hawor_to_vggt_alignment=alignment_json,
         vggt_head_pose=vggt_head_pose,
         scene_points_ply=scene_points_ply,
@@ -180,6 +195,19 @@ def _read_downstream_manifest(downstream_dir: Path) -> dict[str, Any]:
     if not isinstance(datasets, dict):
         raise KeyError(f"downstream manifest missing 'datasets': {manifest_path}")
     return manifest
+
+
+def _object_mesh_output_paths(meshes: tuple[Path, ...], downstream_dir: Path, output_dir: Path) -> list[Path]:
+    """Keep transformed assets under the output, including isolated reruns."""
+    paths = []
+    for index, mesh in enumerate(meshes):
+        try:
+            relative = mesh.resolve().relative_to(downstream_dir.resolve())
+        except ValueError:
+            # Manifests may reference external meshes; never write beside them.
+            relative = Path('meshes') / 'external' / str(index) / mesh.name
+        paths.append(output_dir / 'assets' / relative.parent / f'{mesh.stem}_egoallo.glb')
+    return paths
 
 
 def _downstream_dataset_path(
@@ -263,6 +291,157 @@ def _read_parquet(path: Path):
         raise RuntimeError(f"Reading parquet requires pandas/pyarrow: {path}") from exc
 
 
+def _episode_video_frame_indices(
+    episode_dir: Path, stream_id: str, timestamps_ns: list[int],
+    *, frame_ids: list[int] | None = None,
+    video_fps: float, video_frame_count: int,
+) -> list[int]:
+    """Resolve downstream frame IDs to local prepared-video frame indices.
+
+    The prepared-episode standard defines ``origin.sample_map_uri`` as the
+    authoritative relationship between output frames and the prepared MP4.
+    ``frame_ids`` are downstream output frame IDs and therefore map to the
+    sample map's ``output_frame_index``. Timestamps are retained for alignment
+    and checked against the sample map, but are not used to infer local frame
+    indices. The timestamp-based path remains for callers that use this helper
+    directly without frame IDs and older episode metadata.
+    """
+    episode = read_json_file(episode_dir / "episode.json")
+    stream = next(
+        s for s in episode.get("streams", [])
+        if isinstance(s, dict) and s.get("stream_id") == stream_id
+    )
+    timing = stream.get("time") or {}
+    if timing.get("sampling") != "cfr":
+        raise ValueError(f"RGB extraction requires sampling='cfr': {stream_id}")
+    if timing.get("clock_id") != "episode":
+        raise ValueError(f"RGB extraction requires clock_id='episode': {stream_id}")
+
+    def integer_ns(value, name):
+        try:
+            valid = not isinstance(value, (bool, str)) and np.isfinite(value) and int(value) == value
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            raise ValueError(f"Invalid integer nanoseconds for {name}: {value!r}")
+        return int(value)
+
+    start_ns = integer_ns(timing.get("start_ns"), "RGB time.start_ns")
+    offset_ns = integer_ns(timing.get("video_pts_offset_ns", start_ns), "RGB video_pts_offset_ns")
+    end_ns = timing.get("end_ns")
+    if end_ns is not None:
+        end_ns = integer_ns(end_ns, "RGB time.end_ns")
+        if end_ns <= start_ns:
+            raise ValueError("RGB time.end_ns must exceed time.start_ns")
+    try:
+        fps = float(timing.get("rate_hz"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("RGB time.rate_hz must specify a positive CFR frame rate") from exc
+    if not np.isfinite(fps) or fps <= 0 or not np.isfinite(video_fps) or video_fps <= 0:
+        raise ValueError(f"Invalid RGB frame rate: metadata={fps}, video={video_fps}")
+    if not np.isclose(fps, video_fps, rtol=1e-4, atol=1e-6):
+        raise ValueError(f"RGB frame rate mismatch: metadata={fps}, video={video_fps}")
+    if video_frame_count <= 0:
+        raise ValueError(f"RGB video frame count must be known and positive: {video_frame_count}")
+    if len(timestamps_ns) == 0:
+        raise ValueError("Camera trajectory has no timestamps for RGB extraction")
+    if frame_ids is not None and len(frame_ids) != len(timestamps_ns):
+        raise ValueError(
+            f"Camera frame_id/timestamp length mismatch: frame_ids={len(frame_ids)}, "
+            f"timestamps={len(timestamps_ns)}"
+        )
+
+    def stream_sample_map_path() -> Path:
+        origin = stream.get("origin") or {}
+        raw_uri = str(origin.get("sample_map_uri") or "").strip()
+        if not raw_uri:
+            raise ValueError(
+                f"RGB stream is missing origin.sample_map_uri required for output-frame mapping: {stream_id}"
+            )
+        path = Path(raw_uri).expanduser()
+        path = path.resolve() if path.is_absolute() else (episode_dir / path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"RGB sample map not found: {path}")
+        return path
+
+    if frame_ids is not None:
+        sample_map = _read_parquet(stream_sample_map_path())
+        required_columns = {"output_frame_index", "output_timestamp_ns"}
+        missing_columns = sorted(required_columns.difference(sample_map.columns))
+        if missing_columns:
+            raise ValueError(
+                f"RGB sample map missing required columns for {stream_id}: {missing_columns}"
+            )
+        sample_map = sample_map.sort_values("output_frame_index", kind="stable")
+
+        output_indices = []
+        output_timestamps = []
+        for row_index, row in sample_map.iterrows():
+            output_indices.append(
+                integer_ns(row["output_frame_index"], f"RGB sample-map output_frame_index at row {row_index}")
+            )
+            output_timestamps.append(
+                integer_ns(row["output_timestamp_ns"], f"RGB sample-map output_timestamp_ns at row {row_index}")
+            )
+        if len(output_indices) != video_frame_count:
+            raise ValueError(
+                f"RGB sample map/video frame count mismatch: stream={stream_id}, "
+                f"sample_map_rows={len(output_indices)}, video_frame_count={video_frame_count}"
+            )
+        expected_indices = list(range(video_frame_count))
+        if output_indices != expected_indices:
+            raise ValueError(
+                f"RGB sample map output_frame_index must be contiguous 0..{video_frame_count - 1}: "
+                f"stream={stream_id}, first={output_indices[:3]}, last={output_indices[-3:]}"
+            )
+        timestamp_by_output_index = dict(zip(output_indices, output_timestamps))
+
+        indices = []
+        for row_index, (frame_id_value, timestamp_value) in enumerate(zip(frame_ids, timestamps_ns)):
+            frame_id = integer_ns(frame_id_value, f"camera frame_id at row {row_index}")
+            timestamp = integer_ns(timestamp_value, f"camera timestamp_ns at row {row_index}")
+            if timestamp < start_ns - 1 or (end_ns is not None and timestamp >= end_ns):
+                raise ValueError(
+                    f"Camera timestamp outside RGB episode time: row={row_index}, "
+                    f"timestamp_ns={timestamp}, range=[{start_ns}, {end_ns})"
+                )
+            expected_timestamp = timestamp_by_output_index.get(frame_id)
+            if expected_timestamp is None:
+                raise ValueError(
+                    f"Camera frame_id is absent from RGB sample map: row={row_index}, "
+                    f"frame_id={frame_id}, stream={stream_id}"
+                )
+            if abs(timestamp - expected_timestamp) > 1:
+                raise ValueError(
+                    f"Camera timestamp does not match RGB sample map: row={row_index}, "
+                    f"frame_id={frame_id}, timestamp_ns={timestamp}, "
+                    f"sample_map_timestamp_ns={expected_timestamp}"
+                )
+            indices.append(frame_id)
+        print(
+            f"[Frames] sample-map output frame -> local CFR video frame: stream={stream_id}, "
+            f"fps={fps:g}, rows={len(indices)}; timestamps validated",
+            flush=True,
+        )
+        return indices
+
+    indices = []
+    for row_index, value in enumerate(timestamps_ns):
+        timestamp = integer_ns(value, f"camera timestamp_ns at row {row_index}")
+        # Subtract integer times before floating-point conversion. Allow only
+        # 1ns start-boundary rounding (e.g. 30Hz ticks represented as integers).
+        delta_ns = timestamp - offset_ns
+        if timestamp < start_ns - 1 or delta_ns < -1 or (end_ns is not None and timestamp >= end_ns):
+            raise ValueError(f"Camera timestamp outside RGB episode time: row={row_index}, timestamp_ns={timestamp}, range=[{start_ns}, {end_ns})")
+        frame_index = int(round(delta_ns * fps / 1e9))
+        if frame_index < 0 or frame_index >= video_frame_count:
+            raise ValueError(f"Video frame out of range: row={row_index}, timestamp_ns={timestamp}, video_frame_idx={frame_index}, video_frame_count={video_frame_count}")
+        indices.append(frame_index)
+    print(f"[Frames] episode timestamps -> local CFR video frames: stream={stream_id}, "
+          f"fps={fps:g}, first_video_episode_ns={offset_ns}, rows={len(indices)}; legacy timestamp mapping", flush=True)
+    return indices
+
+
 def _extract_rgb_frames(
     *,
     episode_dir: Path,
@@ -282,30 +461,34 @@ def _extract_rgb_frames(
         stream_id=rgb_stream_id,
     )
     table = _read_parquet(camera_parquet)
-    rows = list(table.iterrows())
-    if frame_count is not None and int(frame_count) > 0 and int(frame_count) < len(rows):
-        indices = sorted(
-            set(
-                np.linspace(0, len(rows) - 1, int(frame_count))
-                .round()
-                .astype(int)
-                .tolist()
-            )
-        )
-        rows = [rows[i] for i in indices]
-
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open episode RGB video: {video_path}")
     try:
+        video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        table = table.assign(
+            video_frame_idx=_episode_video_frame_indices(
+                episode_dir, rgb_stream_id, table["timestamp_ns"].tolist(),
+                frame_ids=table["frame_id"].tolist(),
+                video_fps=float(cap.get(cv2.CAP_PROP_FPS)), video_frame_count=video_frame_count,
+            )
+        )
+        # Validate ALL trajectory times before subsampling or writing images.
+        rows = list(table.iterrows())
+        if frame_count is not None and 0 < int(frame_count) < len(rows):
+            indices = sorted(set(np.linspace(0, len(rows) - 1, int(frame_count)).round().astype(int).tolist()))
+            rows = [rows[i] for i in indices]
         for _, row in rows:
             frame_id = int(row["frame_id"])
             source_frame_idx = int(row["source_frame_idx"])
-            cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame_idx)
+            video_frame_idx = int(row["video_frame_idx"])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
             ok, frame = cap.read()
             if not ok or frame is None:
                 raise RuntimeError(
-                    f"Failed to read source frame {source_frame_idx} from {video_path}"
+                    f"Failed to read video frame: frame_id={frame_id}, "
+                    f"source_frame_idx={source_frame_idx}, video_frame_idx={video_frame_idx}, "
+                    f"video_frame_count={video_frame_count}: {video_path}"
                 )
             output_path = frames_dir / f"{frame_id:06d}.jpg"
             if not cv2.imwrite(str(output_path), frame):
@@ -395,9 +578,12 @@ def _write_hands_jsonl(hands_parquet: Path, output_path: Path) -> None:
         by_frame.setdefault(
             frame_id,
             {
+                "frame_id": frame_id,
+                "src_frame_id": source_frame_idx,
                 "extracted_idx": frame_id,
                 "original_frame_idx": source_frame_idx,
                 "timestamp": timestamp,
+                "timestamp_ns": int(row["timestamp_ns"]),
                 "hands": [],
             },
         )["hands"].append(hand)
@@ -510,6 +696,10 @@ def read_imu_alignment_decision(align_meta: Path) -> dict[str, Any]:
                 "imu_mode": bool(item("imu_mode", False)),
                 "used_imu_gravity": bool(item("used_imu_gravity", False)),
                 "accepted": imu_stats.get("accepted"),
+                "reference_only": bool(imu_stats.get("reference_only", False)),
+                "ground_plane_trusted": item("ground_plane_trusted", None),
+                "metric_scale_trusted": item("metric_scale_trusted", None),
+                "fallback_reference": imu_stats.get("floor_fit") if imu_stats.get("reference_only") else None,
                 "reject_reason": imu_stats.get("reject_reason"),
                 "num_candidates_tried": imu_stats.get("num_candidates_tried"),
                 "decision_reason": str(item("decision_reason", "")),
@@ -518,6 +708,33 @@ def read_imu_alignment_decision(align_meta: Path) -> dict[str, Any]:
             }
     except Exception as exc:  # diagnostics only, never fail the pipeline here
         return {"status": "unreadable", "align_meta": str(align_meta), "error": repr(exc)}
+
+
+def mark_alignment_reference_only(path: Path, reason: str) -> None:
+    """Keep the exact display transform, but revoke physical-floor trust."""
+    with np.load(path, allow_pickle=True) as data:
+        values = {key: data[key].copy() for key in data.files}
+    stats = json.loads(str(values.get("imu_stats_json", "{}")))
+    stats.setdefault("geometric_plane_accepted", stats.get("accepted"))
+    stats.update(accepted=False, reference_only=True, ground_plane_trusted=False,
+                 metric_scale_trusted=False, reject_reason=reason)
+    values["imu_stats_json"] = np.asarray(json.dumps(stats))
+    values.setdefault("geometric_decision_reason", values.get("decision_reason", np.asarray("")))
+    values.update(reference_only=np.asarray(True), ground_plane_trusted=np.asarray(False),
+                  metric_scale_trusted=np.asarray(False), decision_reason=np.asarray(reason))
+    np.savez_compressed(path, **values)
+
+
+def configure_reference_only_export(cmd: list[str], reason: str, *, output_dir: Path,
+                                    head_name: str, hands_name: str, timestamps: Path,
+                                    hands: Path, rotation: Path, alignment: Path) -> None:
+    """Use normal shared-coordinate exporters even if frontend export was disabled."""
+    cmd.extend(["--alignment-only", "--alignment-only-reason", reason])
+    if "--export-frontend-jsonl" not in cmd:
+        cmd.extend(["--export-frontend-jsonl", "--frontend-output-dir", str(output_dir),
+                    "--frontend-head-jsonl-name", head_name, "--frontend-hands-jsonl-name", hands_name,
+                    "--timestamps-txt", str(timestamps), "--hands-vggt-jsonl-in", str(hands),
+                    "--R-align", str(rotation), "--align-meta", str(alignment)])
 
 
 def add_flag(cmd: list[str], flag: str, value: Any) -> None:
@@ -538,6 +755,10 @@ def build_subprocess_env(cfg: dict[str, Any]) -> dict[str, str]:
     env["PROJECT_ROOT"] = str(PROJECT_ROOT)
     env["SCRIPTS_DIR"] = str(SCRIPTS_DIR)
     env["PYTHON_EXECUTABLE"] = sys.executable
+    for key, name in (("preprocess_threads", "EGO_UNI_PREPROCESS_THREADS"),
+                      ("torch_cpu_threads", "EGO_UNI_TORCH_CPU_THREADS")):
+        value = env.get(name, get_cfg(cfg, f"runtime.{key}", 1))
+        env[name] = str(thread_count(value, f"runtime.{key}"))
 
     # Only project scripts are added here. Model source roots are passed through
     # env/config so each subprocess owns its import path.
@@ -653,7 +874,7 @@ def _json_friendly(value: Any) -> Any:
     return value
 
 
-def _write_pointcloud_manifest_parquet(path: Path, pointcloud_name: str) -> None:
+def _write_pointcloud_manifest_parquet(path: Path, pointcloud_name: str, *, reference_only: bool = False) -> None:
     import pandas as pd
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -664,7 +885,10 @@ def _write_pointcloud_manifest_parquet(path: Path, pointcloud_name: str) -> None
                 "coordinate_system": "egoallo_world",
                 "up_axis": "z",
                 "floor_z": 0.0,
-                "length_unit": "meter",
+                "length_unit": "input_units" if reference_only else "meter",
+                "reference_only": reference_only,
+                "ground_plane_trusted": False if reference_only else None,
+                "metric_scale_trusted": False if reference_only else None,
             }
         ]
     ).to_parquet(path, index=False, engine="pyarrow")
@@ -689,7 +913,10 @@ def _write_jsonl_parquet(src: Path, dst: Path, *, kind: str) -> None:
                 "timestamp": float(rec.get("timestamp", 0.0)),
                 "src_frame_id": int(rec.get("src_frame_id", frame_id)),
                 "coordinate_system": str(rec.get("coordinate_system", {}).get("name", "egoallo_world")),
-                "length_unit": "meter",
+                "length_unit": "input_units" if rec.get("coordinate_system", {}).get("units") == "input_units" else "meter",
+                "reference_only": rec.get("coordinate_system", {}).get("reference_only", False),
+                "ground_plane_trusted": rec.get("coordinate_system", {}).get("ground_plane_trusted"),
+                "metric_scale_trusted": rec.get("coordinate_system", {}).get("metric_scale_trusted"),
             }
             if kind == "head":
                 head = rec.get("head", {})
@@ -795,6 +1022,7 @@ def _export_assets(
     frontend_hands_jsonl: Path,
     objects_egoallo_parquet: Path,
     final_motion_npz: Path,
+    reference_only: bool = False,
 ) -> dict[str, Any]:
     pointclouds_dir = _assets_pointclouds_dir(output_dir, cfg)
     poses_dir = _assets_poses_dir(output_dir, cfg)
@@ -806,7 +1034,7 @@ def _export_assets(
     if final_scene_ply.resolve() != final_scene_asset.resolve():
         shutil.copy2(final_scene_ply, final_scene_asset)
     pointcloud_manifest = pointclouds_dir / "pointclouds.parquet"
-    _write_pointcloud_manifest_parquet(pointcloud_manifest, final_scene_name)
+    _write_pointcloud_manifest_parquet(pointcloud_manifest, final_scene_name, reference_only=reference_only)
 
     head_parquet = poses_dir / (frontend_head_jsonl.stem + ".parquet")
     hands_parquet = poses_dir / (frontend_hands_jsonl.stem + ".parquet")
@@ -1227,6 +1455,9 @@ class PipelineRunRecorder:
 def run(cmd: list[str], *, cwd: Path = PROJECT_ROOT, env: dict[str, str] | None = None) -> None:
     global PIPELINE_RECORDER
 
+    if len(cmd) > 1 and Path(cmd[1]).resolve() in CPU_PREPROCESS_SCRIPTS:
+        env = preprocessing_env(os.environ if env is None else env)
+
     command_str = " ".join(str(x) for x in cmd)
     print("\n[CMD]", command_str, flush=True)
 
@@ -1262,6 +1493,7 @@ def run(cmd: list[str], *, cwd: Path = PROJECT_ROOT, env: dict[str, str] | None 
         "command": [str(x) for x in cmd],
         "command_str": command_str,
         "return_code": int(return_code),
+        "thread_environment": {name: env[name] for name in BLAS_THREAD_ENV if env and name in env},
         "stdout_stderr": combined_output,
     }
     if PIPELINE_RECORDER is not None:
@@ -1406,6 +1638,7 @@ def main() -> None:
                 "frames_dir": str(frames_dir),
                 "cam_space_dir": str(cam_space_dir),
                 "hawor_hands_vggt_world": str(hawor_hands_vggt_world),
+                "egoallo_hand_input_parquet": str(upstream.hands_parquet),
                 "hawor_to_vggt_alignment": str(hawor_to_vggt_alignment),
                 "vggt_head_pose": str(vggt_head_pose),
                 "scene_points_ply": str(scene_points_ply),
@@ -1447,10 +1680,7 @@ def main() -> None:
     frontend_head_jsonl = egogvae_outputs_dir / frontend_head_name
     frontend_hands_jsonl = egogvae_outputs_dir / frontend_hands_name
     objects_egoallo_parquet = egogvae_outputs_dir / "objects_egoallo.parquet"
-    object_mesh_outputs = [
-        mesh.parent / f"{mesh.stem}_egoallo.glb"
-        for mesh in object_meshes
-    ]
+    object_mesh_outputs = _object_mesh_output_paths(object_meshes, downstream_dir, output_dir)
     motion_quality_report_json = tmp_dir / str(get_cfg(cfg, "egogvae.report_json_name", "motion_quality_report.json"))
     egoallo_refine_report_json = tmp_dir / str(get_cfg(cfg, "egoallo_refine.report_json_name", "egoallo_refine_report.json"))
     egoallo_hawor_cache_npz = tmp_dir / str(get_cfg(cfg, "egoallo_refine.cache_npz_name", "egoallo_hawor_final_cache.npz"))
@@ -1468,6 +1698,7 @@ def main() -> None:
     metric_scale_metadata_json = tmp_dir / "metric_scale_metadata.json"
     real_depth_scale_json = tmp_dir / "real_depth_scale_estimate.json"
     real_imu_alignment_failed = False
+    reference_only_reason: str | None = None
 
     mano_left = resolve_project_path(get_cfg(cfg, "model_weights.mano_left_pkl"))
     mano_right = resolve_project_path(get_cfg(cfg, "model_weights.mano_right_pkl"))
@@ -1564,7 +1795,7 @@ def main() -> None:
     add_flag(cmd, "--print-jump-stats", get_cfg(cfg, "hawor_extract.print_jump_stats", True))
     run(cmd, env=env)
 
-    # 03: stabilize hands
+    # 03: stabilize hands for scale estimation. EgoAllo uses upstream geometry.
     run([
         py,
         str(SCRIPT_03_STABILIZE_HANDS),
@@ -1582,34 +1813,43 @@ def main() -> None:
         "--duplicate-mode", str(get_cfg(cfg, "hawor_stabilize.duplicate_mode", "keep_best")),
     ], env=env)
 
-    # HaWoR -> VGGT rotation. If no hands were detected upstream, the alignment
+    # EgoAllo takes every upstream 30 FPS hand record, without the scale
+    # estimation branch's filtering, smoothing or gap filling.
+    egoallo_hands_jsonl = hawor_hands_vggt_world
+
+    # sim3.R maps column vectors from HaWoR camera to scene camera; do not
+    # transpose it when transforming the MANO global orientation.
+    # If no hands were detected upstream, the alignment
     # file may be absent; use identity so the empty-hand path can still finish.
     run([
         py,
         str(SCRIPT_EXTRACT_ROT),
         "--alignment-json", str(hawor_to_vggt_alignment),
         "--json-key", "sim3.R",
-        "--transpose",
         "--output-npy", str(R_hawor_to_vggt_npy),
         "--missing-is-identity",
     ], env=env)
 
-    # 04: build hamer pkl from HaWoR world hands for scale/frontend outputs.
-    run([
+    # 04: MANO chunks retain original sampled camera IDs. Interpolate their
+    # parameters onto the 30 FPS hand timeline using episode timestamps.
+    hamer_build_cmd = [
         py,
         str(SCRIPT_04_BUILD_HAMER),
-        "--prepared-hands-jsonl", str(stable_hands_jsonl),
+        "--prepared-hands-jsonl", str(egoallo_hands_jsonl),
         "--camera-poses-txt", str(camera_poses_txt),
         "--timestamps-txt", str(timestamps_txt),
         "--output-pkl", str(hamer_outputs_pkl_tmp),
         "--cam-space-left-dir", str(cam_space_dir / str(get_cfg(cfg, "hamer_build.cam_space_left_subdir", "0"))),
         "--cam-space-right-dir", str(cam_space_dir / str(get_cfg(cfg, "hamer_build.cam_space_right_subdir", "1"))),
         "--mano-frame-key", str(get_cfg(cfg, "hamer_build.mano_frame_key", "frame_id")),
-        "--mano-lookup-field", str(get_cfg(cfg, "hamer_build.mano_lookup_field", "frame_id")),
         "--mano-left-pkl", str(mano_left),
         "--mano-right-pkl", str(mano_right),
         "--camera-frame-rotation-npy", str(R_hawor_to_vggt_npy),
-    ], env=env)
+    ]
+    mano_timeline = cam_space_dir.parent / "camera.parquet"
+    if mano_timeline.is_file():
+        hamer_build_cmd.extend(["--mano-timeline-parquet", str(mano_timeline)])
+    run(hamer_build_cmd, env=env)
 
     if not real_sensor_has_imu:
         # GeoCalib gravity：可选参数从 YAML 的 geocalib 段读取。
@@ -1722,9 +1962,12 @@ def main() -> None:
         )
         if alignment_decision.get("accepted") is False:
             real_imu_alignment_failed = True
+            reference_only_reason = "imu_floor_estimation_failed"
+            mark_alignment_reference_only(alignment_transform_npz, reference_only_reason)
+            alignment_decision = read_imu_alignment_decision(alignment_transform_npz)
             print(
-                "[IMU] alignment failed; still exporting aligned inputs/scene, "
-                "then EgoGVAE inference will be skipped.",
+                "[IMU] floor estimation failed; exporting IMU-aligned inputs/scene "
+                "at input scale. Metric scale and body inference will be skipped.",
                 flush=True,
             )
 
@@ -1747,6 +1990,7 @@ def main() -> None:
     real_depth_scale_reason = "not_run"
     foundationgeo_enabled = (
         metric_scale_enabled
+        and not real_imu_alignment_failed
         and bool(get_cfg(cfg, "metric_scale.foundationgeo.enabled", False))
     )
     foundationgeo_model_pt: Path | None = None
@@ -1840,7 +2084,7 @@ def main() -> None:
         metric_scale_cmd.extend([
             "--hand-max-camera-distance-m", str(get_cfg(cfg, "hand_filter.max_camera_distance_m", 1.2)),
         ])
-    if bool(get_cfg(cfg, "metric_scale.frontend.enabled", True)):
+    if real_imu_alignment_failed or bool(get_cfg(cfg, "metric_scale.frontend.enabled", True)):
         metric_scale_cmd.extend([
             "--export-frontend-jsonl",
             "--frontend-output-dir", str(egogvae_outputs_dir),
@@ -1860,7 +2104,13 @@ def main() -> None:
     # Metric scale
     # 05_apply_metric_scale.py no longer reads YAML directly. run_body_mesh.py is the single
     # config owner: it reads metric_scale.* from YAML and passes concrete CLI args here.
-    if metric_scale_enabled:
+    if real_imu_alignment_failed:
+        real_depth_scale_reason = "skipped_imu_floor_estimation_failed"
+        # Reuse all normal geometry exporters, but never call a scale estimator
+        # or apply a height cap / metric-distance filter on this fallback path.
+        metric_scale_cmd.extend(["--alignment-only", "--alignment-only-reason", reference_only_reason])
+        run(metric_scale_cmd, env=env)
+    elif metric_scale_enabled:
         hand_scale_bones_json = tmp_dir / "hand_scale_bones.json"
         with hand_scale_bones_json.open("w", encoding="utf-8") as f:
             json.dump(
@@ -1871,7 +2121,7 @@ def main() -> None:
             )
 
         if real_sensor_has_depth:
-            run([
+            real_depth_cmd = [
                 py,
                 str(SCRIPT_PREPARE_REAL_SENSOR),
                 "--episode-dir", str(real_sensor_input),
@@ -1881,13 +2131,30 @@ def main() -> None:
                 "--head-trajectory-in", str(head_trajectory_tmp),
                 "--point-cloud-r-align", str(R_align_npy),
                 "--point-cloud-align-meta", str(alignment_transform_npz),
-                "--depth-unit-scale", str(get_cfg(cfg, "real_sensor.depth_unit_scale", 1.0)),
-                "--num-samples", str(get_cfg(cfg, "real_sensor.depth_scale_num_samples", 64)),
+                "--depth-cache-mb", str(get_cfg(cfg, "real_sensor.depth_cache_mb", 512)),
+                "--num-samples", str(get_cfg(cfg, "real_sensor.depth_scale_num_samples", 96)),
+                "--depth-confidence-min", str(get_cfg(cfg, "real_sensor.depth_confidence_min", 0.5)),
+                "--depth-min-disparity-px", str(get_cfg(cfg, "real_sensor.depth_min_disparity_px", 0.0)),
+                "--floor-max-histogram-bins", str(get_cfg(cfg, "real_sensor.depth_floor_max_histogram_bins", 4096)),
                 "--depth-scale-cluster-rel-tol", str(get_cfg(cfg, "real_sensor.depth_scale_cluster_rel_tol", 0.08)),
                 "--depth-scale-min-support-frames", str(get_cfg(cfg, "real_sensor.depth_scale_min_support_frames", 3)),
                 "--depth-scale-local-window", str(get_cfg(cfg, "real_sensor.depth_scale_local_window", 15)),
                 "--depth-scale-local-min-support-frames", str(get_cfg(cfg, "real_sensor.depth_scale_local_min_support_frames", 5)),
-            ], env=env)
+            ]
+            for key, option in (("depth_unit_scale", "--depth-unit-scale"),
+                                ("depth_min_m", "--depth-min-m"), ("depth_max_m", "--depth-max-m"),
+                                ("depth_floor_max_abs_height_m", "--floor-max-abs-height-m")):
+                value = get_cfg(cfg, f"real_sensor.{key}", None)
+                if value is not None:
+                    real_depth_cmd.extend([option, str(value)])
+            for quality in ("validity", "confidence", "disparity"):
+                array_name = get_cfg(cfg, f"real_sensor.depth_{quality}_array", None)
+                if array_name:
+                    real_depth_cmd.extend([f"--depth-{quality}-array", str(array_name)])
+            invalid_values = get_cfg(cfg, "real_sensor.depth_invalid_values", [])
+            if invalid_values:
+                real_depth_cmd.extend(["--depth-invalid-values", *[str(v) for v in invalid_values]])
+            run(real_depth_cmd, env=env)
             try:
                 with real_depth_scale_json.open("r", encoding="utf-8") as f:
                     real_depth_data = json.load(f)
@@ -1902,12 +2169,17 @@ def main() -> None:
                 real_depth_scale_reason = f"read_failed: {exc!r}"
 
             if not real_depth_scale_ok:
-                raise RuntimeError(
-                    "[Metric scale] Real depth scale invalid; stop because real sensor depth is present. "
-                    f"reason={real_depth_scale_reason}; report={real_depth_scale_json}"
+                reference_only_reason = f"real_depth_floor_evidence_failed: {real_depth_scale_reason}"
+                mark_alignment_reference_only(alignment_transform_npz, reference_only_reason)
+                alignment_decision = read_imu_alignment_decision(alignment_transform_npz)
+                configure_reference_only_export(
+                    metric_scale_cmd, reference_only_reason, output_dir=egogvae_outputs_dir,
+                    head_name=frontend_head_name, hands_name=frontend_hands_name, timestamps=timestamps_txt,
+                    hands=hawor_hands_vggt_world, rotation=R_align_npy, alignment=alignment_transform_npz,
                 )
+                print(f"[Metric scale] {reference_only_reason}; preserve display alignment and input scale; skip body inference.", flush=True)
 
-        if foundationgeo_enabled and not real_depth_scale_ok:
+        if foundationgeo_enabled and not real_depth_scale_ok and reference_only_reason is None:
             run_foundationgeo_metric_scale_if_needed()
             if foundationgeo_scale_json is not None:
                 metric_scale_cmd.extend(["--depth-scale-json", str(foundationgeo_scale_json)])
@@ -1933,8 +2205,19 @@ def main() -> None:
             "--output_voxel_size", str(get_cfg(cfg, "metric_scale.final_scene_output_voxel_size", 0.01)),
         ], env=env)
 
+    # Body inference and exports share the camera_30fps-derived inputs after
+    # the existing scene alignment/scale steps; no body-only interpolation.
     pose_validation_enabled = _cfg_bool(get_cfg(cfg, "pose_validation.enabled", True), default=True)
-    if pose_validation_enabled:
+    if reference_only_reason is not None:
+        pose_validation_result = {
+            "enabled": pose_validation_enabled, "status": "skipped",
+            "should_run_egogvae": False, "metric_scale_trusted": False,
+            "ground_plane_trusted": False, "reference_only": True,
+            "egogvae_skip_reason": reference_only_reason,
+        }
+        write_summary(pose_validation_report_json, pose_validation_result)
+        egoallo_refine_result.update(status="skipped", reason=reference_only_reason)
+    elif pose_validation_enabled:
         pose_validation_floor_z = get_cfg(cfg, "pose_validation.floor_z", None)
         if pose_validation_floor_z is None:
             pose_validation_floor_z = get_cfg(cfg, "egogvae.floor_z", None)
@@ -1961,17 +2244,23 @@ def main() -> None:
         print("[Pose validation] disabled; continue to EgoGVAE inference.", flush=True)
 
     should_run_egogvae = bool(pose_validation_result.get("should_run_egogvae", True))
-    if real_imu_alignment_failed:
+    if reference_only_reason is not None:
         should_run_egogvae = False
         pose_validation_result["should_run_egogvae"] = False
-        pose_validation_result["egogvae_skip_reason"] = alignment_decision.get("decision_reason")
+        pose_validation_result["egogvae_skip_reason"] = reference_only_reason
         write_empty_egogvae_npz(
             final_smoothed_npz,
             num_samples=int(get_cfg(cfg, "egoallo_refine.num_samples", 1)),
-            reason=str(alignment_decision.get("decision_reason")),
+            reason=reference_only_reason,
+        )
+        # Replace any prior inference output as well as the published final NPZ.
+        write_empty_egogvae_npz(
+            egogvae_motion_npz,
+            num_samples=int(get_cfg(cfg, "egoallo_refine.num_samples", 1)),
+            reason=reference_only_reason,
         )
         print(
-            "[IMU] wrote empty merged EgoGVAE output after alignment failure: "
+            "[Floor evidence] wrote empty EgoGVAE output for reference-only alignment: "
             f"{final_smoothed_npz}",
             flush=True,
         )
@@ -2091,6 +2380,8 @@ def main() -> None:
                 "target_segment_length": 1024, "context_frames": 36,
                 "window_size": 128, "overlap_size": 32,
                 "hamer_abspos_weight": 20.0, "bucket_t": "auto", "detection_bucket": 0,
+                "hand_reachability_fade_ratio": 0.35,
+                "hand_reachability_min_weight": 0.05,
                 "inner_max_iters": 2, "inner_last_steps": 0, "inner_step_frequency": 1,
                 "post_max_iters": 16, "post_last_steps": 0, "post_step_frequency": 1,
                 "body_smoothing_max_deg": 5.0, "leg_max_iters": 250, "contact_source": "egogvae",
@@ -2103,6 +2394,11 @@ def main() -> None:
             for name, default in refine_defaults.items():
                 egoallo_refine_cmd.extend(["--" + name.replace("_", "-"), str(get_cfg(cfg, "egoallo_refine." + name, default))])
             add_flag(egoallo_refine_cmd, "--verbose", get_cfg(cfg, "egoallo_refine.verbose", False))
+            prewarm_guidance = _cfg_bool(
+                get_cfg(cfg, "jax_guidance.compilation_cache.prewarm_guidance", True), default=True)
+            egoallo_refine_cmd.append("--prewarm-guidance" if prewarm_guidance else "--skip-guidance-prewarm")
+            egoallo_refine_cmd.extend(["--guidance-warmup-mode", str(
+                get_cfg(cfg, "jax_guidance.compilation_cache.warmup_mode", "compile"))])
             run(egoallo_refine_cmd, env=env)
             egoallo_refine_result = read_json_file(egoallo_refine_report_json)
             egoallo_refine_result["enabled"] = True
@@ -2115,9 +2411,9 @@ def main() -> None:
             }
     else:
         egogvae_inference_skipped = True
-        if real_imu_alignment_failed:
+        if reference_only_reason is not None:
             print(
-                "[IMU] alignment failed; skip EgoGVAE inference and keep exported files.",
+                "[Floor evidence] ground/scale untrusted; skip EgoGVAE inference and keep display exports.",
                 flush=True,
             )
         else:
@@ -2144,15 +2440,20 @@ def main() -> None:
         frontend_hands_jsonl=frontend_hands_jsonl,
         objects_egoallo_parquet=objects_egoallo_parquet,
         final_motion_npz=final_smoothed_npz,
+        reference_only=reference_only_reason is not None,
     )
 
     summary = {
         "status": "completed",
         "completion_reason": (
-            "real_imu_alignment_failed_skip_egogvae"
+            "imu_fallback_alignment_only_skip_scale_and_body"
             if real_imu_alignment_failed
-            else "completed"
+            else "depth_fallback_alignment_only_skip_scale_and_body" if reference_only_reason else "completed"
         ),
+        "reference_only": reference_only_reason is not None,
+        "reference_only_reason": reference_only_reason,
+        "ground_plane_trusted": False if reference_only_reason else None,
+        "metric_scale_trusted": False if reference_only_reason else None,
         "project_root": str(PROJECT_ROOT),
         "output_dir": str(output_dir),
         "tmp_dir": str(tmp_dir),
@@ -2160,6 +2461,11 @@ def main() -> None:
         "egogvae_outputs_dir": str(egogvae_outputs_dir),
         "egogvae_tmp_dir": str(egogvae_tmp_dir),
         "assets": assets,
+        "runtime_threads": {
+            "preprocess_threads": env.get("EGO_UNI_PREPROCESS_THREADS"),
+            "torch_cpu_threads": env.get("EGO_UNI_TORCH_CPU_THREADS"),
+            "preprocess_explicit_library_settings_take_precedence": True,
+        },
         "python_cache": {
             "pycache_prefix": env.get("PYTHONPYCACHEPREFIX"),
             "cleanup_existing_scripts_pycache": python_pycache_cleanup,
@@ -2199,7 +2505,7 @@ def main() -> None:
             "foundationgeo_model_pt": env.get("FOUNDATIONGEO_MODEL_PT"),
         },
         "foundationgeo_metric_scale": {
-            "enabled": bool(foundationgeo_enabled and not real_depth_scale_ok),
+            "enabled": bool(foundationgeo_enabled and not real_depth_scale_ok and reference_only_reason is None),
             "output_dir": str(foundationgeo_output_dir) if foundationgeo_output_dir is not None else None,
             "scale_json": str(foundationgeo_scale_json) if foundationgeo_scale_json is not None else None,
         },
@@ -2211,7 +2517,8 @@ def main() -> None:
             "rgb_camera_stream_id": real_sensor_rgb_stream_id,
             "depth_camera_stream_id": real_sensor_depth_stream_id,
             "imu_gravity": str(imu_gravity_txt) if real_sensor_has_imu else None,
-            "depth_scale_json": str(real_depth_scale_json) if real_sensor_has_depth else None,
+            "depth_scale_json": str(real_depth_scale_json)
+            if real_sensor_has_depth and not real_imu_alignment_failed else None,
             "depth_scale_ok": bool(real_depth_scale_ok),
             "depth_scale_reason": real_depth_scale_reason,
             "imu_alignment": alignment_decision or None,
@@ -2230,6 +2537,12 @@ def main() -> None:
         if bool(egoallo_refine_result.get("enabled")) and not egogvae_inference_skipped
         else None,
         "egoallo_refine": egoallo_refine_result,
+        "egoallo_hand_input": {
+            "source": "hands_30fps.parquet",
+            "source_parquet": str(upstream.hands_parquet),
+            "prepared_jsonl": str(egoallo_hands_jsonl),
+            "frontend_source_parquet": str(upstream.hands_parquet),
+        },
         "egogvae": {
             "device": str(get_cfg(cfg, "egogvae.device", get_cfg(cfg, "runtime.device", "cuda"))),
             "window_size": int(get_cfg(cfg, "egogvae.window_size", 128)),

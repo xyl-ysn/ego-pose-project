@@ -5,6 +5,8 @@ import argparse
 import importlib.util
 import json
 import time
+import math
+from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,120 @@ DEPTH_SCALE_CLUSTER_REL_TOL = 0.08
 DEPTH_SCALE_MIN_SUPPORT_FRAMES = 3
 DEPTH_SCALE_LOCAL_WINDOW = 15
 DEPTH_SCALE_LOCAL_MIN_SUPPORT_FRAMES = 5
+DEPTH_MIN_M = None  # Only apply a device range when explicitly provided.
+DEPTH_MAX_M = None
+FLOOR_MAX_ABS_HEIGHT_M = None
+FLOOR_MAX_HISTOGRAM_BINS = 4096
+DEPTH_CACHE_MB = 512.0
+
+
+class DepthInputError(ValueError):
+    """Unsafe/ambiguous depth input: do not continue with guessed metric data."""
+
+
+class TimeChunkCache:
+    """Shared decoded time-slab LRU for depth and quality arrays.
+
+    A slab spans one temporal chunk and the full image. Reading it once lets
+    neighboring sampled frames reuse the decompression of all spatial chunks.
+    The bound covers retained decoded arrays, not codec working memory.
+    """
+
+    def __init__(self, max_bytes: int):
+        if max_bytes <= 0:
+            raise DepthInputError("depth_cache_mb must be positive")
+        self.max_bytes = max_bytes
+        self.items = OrderedDict()
+        self.stats = dict(max_bytes=max_bytes, retained_bytes=0, peak_retained_bytes=0,
+                          slab_reads=0, hits=0, evictions=0)
+
+    def slab_size(self, array):
+        chunks = getattr(array, "chunks", None)
+        temporal = int(chunks[0]) if chunks else 1
+        size = min(temporal, int(array.shape[0])) * math.prod(array.shape[1:]) * np.dtype(array.dtype).itemsize
+        return temporal, size
+
+    def validate(self, arrays):
+        # One active slab per array must fit, otherwise interleaved quality
+        # reads would evict depth on every frame and recreate the original bug.
+        required = sum(self.slab_size(array)[1] for array in arrays)
+        if required > self.max_bytes:
+            raise DepthInputError(
+                f"Depth/quality active time chunks require {required / 2**20:.1f} MiB decoded, "
+                f"above depth_cache_mb={self.max_bytes / 2**20:g}; increase the cache budget "
+                "or rechunk upstream along time. No oversized slab was read.")
+
+    def read(self, array, frame_id):
+        temporal, _ = self.slab_size(array)
+        start = frame_id // temporal * temporal
+        end = min(start + temporal, int(array.shape[0]))
+        key = (id(array), start)
+        if key in self.items:
+            self.stats["hits"] += 1
+            self.items.move_to_end(key)
+        else:
+            required = (end - start) * math.prod(array.shape[1:]) * np.dtype(array.dtype).itemsize
+            if required > self.max_bytes:
+                self.validate([array])
+            while self.items and self.stats["retained_bytes"] + required > self.max_bytes:
+                _, previous = self.items.popitem(last=False)
+                self.stats["retained_bytes"] -= previous.nbytes
+                self.stats["evictions"] += 1
+                del previous
+            block = np.asarray(array[start:end]).copy() if isinstance(array, np.ndarray) else np.asarray(array[start:end])
+            block.flags.writeable = False
+            self.items[key] = block
+            self.stats["slab_reads"] += 1
+            self.stats["retained_bytes"] += block.nbytes
+            self.stats["peak_retained_bytes"] = max(self.stats["peak_retained_bytes"], self.stats["retained_bytes"])
+        # Caller owns its frame. Filtering must never alter a cached slab or
+        # keep an evicted slab alive through a view into it.
+        return self.items[key][frame_id - start].copy()
+
+
+def resolve_depth_metadata(source: dict[str, Any], explicit_scale: float | None,
+                           invalid_values=()) -> dict[str, Any]:
+    """Units describe the DECODED array, never storage codec scale/offset."""
+    sources = source.get("metadata_sources", [])
+    unit_factors = {"m": 1., "meter": 1., "meters": 1., "metre": 1., "metres": 1.,
+                    "mm": .001, "millimeter": .001, "millimeters": .001,
+                    "millimetre": .001, "millimetres": .001,
+                    "cm": .01, "centimeter": .01, "centimeters": .01,
+                    "centimetre": .01, "centimetres": .01}
+    declarations = []
+    invalid = list(invalid_values or [])
+    for location, attrs in sources:
+        for key in ("depth_unit", "unit", "units"):
+            if attrs.get(key) is None:
+                continue
+            unit = str(attrs[key]).strip().lower()
+            if unit not in unit_factors:
+                raise DepthInputError(f"Unsupported depth unit {attrs[key]!r} in {location}.{key}")
+            declarations.append(dict(source=f"{location}.{key}", unit=unit, scale_to_m=unit_factors[unit]))
+        for key in ("invalid_depth_value", "invalid_depth_values", "_FillValue", "missing_value"):
+            if attrs.get(key) is not None:
+                value = attrs[key]
+                invalid.extend(value if isinstance(value, (list, tuple)) else [value])
+    factors = {item["scale_to_m"] for item in declarations}
+    if len(factors) > 1:
+        raise DepthInputError(f"Conflicting decoded depth units: {declarations}")
+    declared_scale = next(iter(factors), None)
+    if explicit_scale is not None:
+        explicit_scale = float(explicit_scale)
+        if not np.isfinite(explicit_scale) or explicit_scale <= 0:
+            raise DepthInputError("depth_unit_scale must be positive and finite")
+        if declared_scale is not None and not np.isclose(explicit_scale, declared_scale, rtol=1e-9, atol=0):
+            raise DepthInputError(f"depth_unit_scale={explicit_scale} conflicts with decoded metadata scale={declared_scale}; "
+                                  "storage codec scale must not be applied twice")
+    resolved = declared_scale if declared_scale is not None else explicit_scale
+    if resolved is None:
+        raise DepthInputError("Depth unit metadata missing; explicitly configure depth_unit_scale (meters=1, millimeters=0.001)")
+    try:
+        invalid = sorted({float(v) for v in invalid if np.isfinite(float(v))})
+    except (TypeError, ValueError) as exc:
+        raise DepthInputError("Invalid depth sentinel metadata/configuration") from exc
+    return dict(scale_to_m=resolved, scale_source="decoded_array_metadata" if declared_scale is not None else "explicit_configuration",
+                unit_declarations=declarations, invalid_values_decoded=invalid)
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,8 +168,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-trajectory-in", type=Path, default=None)
     parser.add_argument("--point-cloud-r-align", type=Path, default=None)
     parser.add_argument("--point-cloud-align-meta", type=Path, default=None)
-    parser.add_argument("--depth-unit-scale", type=float, default=1.0)
-    parser.add_argument("--num-samples", type=int, default=64)
+    parser.add_argument("--depth-unit-scale", type=float, default=None)
+    parser.add_argument("--depth-cache-mb", type=float, default=DEPTH_CACHE_MB)
+    parser.add_argument("--depth-invalid-values", type=float, nargs="*", default=[])
+    parser.add_argument("--num-samples", type=int, default=96)
+    parser.add_argument("--depth-min-m", type=float, default=DEPTH_MIN_M)
+    parser.add_argument("--depth-max-m", type=float, default=DEPTH_MAX_M)
+    parser.add_argument("--depth-validity-array", default=None)
+    parser.add_argument("--depth-confidence-array", default=None)
+    parser.add_argument("--depth-confidence-min", type=float, default=0.5)
+    parser.add_argument("--depth-disparity-array", default=None)
+    parser.add_argument("--depth-min-disparity-px", type=float, default=0.0)
+    parser.add_argument("--floor-max-abs-height-m", type=float, default=FLOOR_MAX_ABS_HEIGHT_M)
+    parser.add_argument("--floor-max-histogram-bins", type=int, default=FLOOR_MAX_HISTOGRAM_BINS)
     parser.add_argument(
         "--depth-scale-cluster-rel-tol",
         type=float,
@@ -99,7 +226,15 @@ def resolve_uri(root: Path, uri: str) -> Path:
 
 
 def open_depth_frames(root: Path, stream: dict[str, Any]) -> dict[str, Any]:
-    """Open the new episode zarr depth stream as a frame source."""
+    """Open an episode Zarr depth stream, including the zpds-depth-cp codec.
+
+    ``camera_ego_depth.zarr`` uses the ``centerdepth.log_sz3.v1`` Numcodecs
+    codec.  Importing :mod:`zpds_depth_cp` is part of that format's reader
+    contract: the import registers the codec before Zarr deserializes the
+    array's compressor configuration.  A plain ``zarr.open`` therefore fails
+    with ``UnknownCodecError`` even though the store itself is otherwise a
+    valid Zarr v2 directory.
+    """
     raw_uri = str(stream.get("uri") or "").strip()
     if not raw_uri:
         raise KeyError(f"Depth stream missing uri: {stream.get('stream_id')}")
@@ -111,6 +246,34 @@ def open_depth_frames(root: Path, stream: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - dependency diagnostic
         raise RuntimeError("zarr is required to read episode depth zarr") from exc
 
+    # Inspect the small Zarr metadata file before opening the array.  This
+    # keeps ordinary Zarr depth streams usable without an optional codec while
+    # still registering zpds-depth-cp before Zarr constructs a custom codec.
+    codec_id = None
+    metadata_path = path / array_name / ".zarray"
+    if not metadata_path.is_file():
+        metadata_path = path / ".zarray"
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            compressor = metadata.get("compressor") or {}
+            codec_id = compressor.get("id") if isinstance(compressor, dict) else None
+        except (OSError, ValueError, TypeError):
+            # Let Zarr produce the canonical metadata error below.
+            codec_id = None
+    if codec_id in {"centerdepth.log_sz3.v1", "centerdepth.sz3.v1"}:
+        try:
+            # Import for its Numcodecs registration side effect.  Keep this
+            # before zarr.open: the compressor is constructed during open.
+            import zpds_depth_cp  # noqa: F401
+        except Exception as exc:  # pragma: no cover - dependency diagnostic
+            raise RuntimeError(
+                f"This episode uses {codec_id}; install the reader with "
+                "`python -m pip install "
+                "git+https://github.com/happy-coder-yhy/zpds-depth-cp.git@main` "
+                "(plus pysz==1.0.3)"
+            ) from exc
+
     root_zarr = zarr.open(str(path), mode="r")
     try:
         array = root_zarr[array_name]
@@ -120,7 +283,7 @@ def open_depth_frames(root: Path, stream: dict[str, Any]) -> dict[str, Any]:
         else:
             raise KeyError(f"Depth zarr missing array '{array_name}': {path}")
 
-    if not hasattr(array, "shape") or len(array.shape) < 3:
+    if not hasattr(array, "shape") or len(array.shape) != 3:
         raise ValueError(f"Depth zarr array must have shape (frames, height, width): {path}")
 
     return {
@@ -130,18 +293,98 @@ def open_depth_frames(root: Path, stream: dict[str, Any]) -> dict[str, Any]:
         "array": array,
         "frame_count": int(array.shape[0]),
         "shape": [int(v) for v in array.shape],
+        "root_zarr": root_zarr,
+        "metadata_sources": [("episode_stream", stream), ("zarr_root", dict(root_zarr.attrs)),
+                             ("zarr_array", dict(array.attrs))],
     }
 
 
-def read_depth_frame(depth_source: dict[str, Any], frame_id: int, unit_scale: float) -> np.ndarray:
+def configure_depth_filter(depth_source: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Use explicit metric limits and optional aligned quality arrays; never guess their semantics."""
+    minimum = getattr(args, "depth_min_m", DEPTH_MIN_M)
+    maximum = getattr(args, "depth_max_m", DEPTH_MAX_M)
+    minimum = float(minimum) if minimum is not None else None
+    maximum = float(maximum) if maximum is not None else None
+    if any(v is not None and (not np.isfinite(v) or v <= 0) for v in (minimum, maximum)):
+        raise ValueError("Depth range endpoints must be positive and finite or unset")
+    if minimum is not None and maximum is not None and minimum >= maximum:
+        raise ValueError("Require depth_min_m < depth_max_m")
+    info = {"min_m": minimum, "max_m": maximum,
+            "range_source": "explicit_configuration" if minimum is not None or maximum is not None else "unset_no_scene_range_assumed"}
+    quality = {}
+    for name in ("validity", "confidence", "disparity"):
+        array_name = getattr(args, f"depth_{name}_array", None)
+        info[f"{name}_array"] = array_name
+        if array_name:
+            array = depth_source["root_zarr"][array_name]
+            if tuple(array.shape) != tuple(depth_source["shape"]):
+                raise ValueError(f"Depth {name} array shape mismatch: {array.shape}")
+            quality[name] = array
+    info["confidence_min"] = float(getattr(args, "depth_confidence_min", 0.5))
+    info["min_disparity_px"] = float(getattr(args, "depth_min_disparity_px", 0.0))
+    if not np.isfinite(info["confidence_min"]) or not np.isfinite(info["min_disparity_px"]) or info["min_disparity_px"] < 0:
+        raise ValueError("Invalid confidence/disparity threshold")
+    depth_source.update(filter_config=info, quality_arrays=quality, filter_stats={})
+    return info
+
+
+def configure_depth_io(source: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    metadata = resolve_depth_metadata(source, getattr(args, "depth_unit_scale", None),
+                                      getattr(args, "depth_invalid_values", []))
+    budget = float(getattr(args, "depth_cache_mb", DEPTH_CACHE_MB))
+    if not np.isfinite(budget) or budget <= 0:
+        raise DepthInputError("depth_cache_mb must be positive and finite")
+    cache = TimeChunkCache(int(budget * 2**20))
+    cache.validate([source["array"], *source.get("quality_arrays", {}).values()])
+    source.update(depth_metadata=metadata, decoded_cache=cache)
+    return dict(**metadata, chunks=list(getattr(source["array"], "chunks", None) or (1, *source["array"].shape[1:])),
+                cache=cache.stats)
+
+
+def read_depth_frame(depth_source: dict[str, Any], frame_id: int, unit_scale: float | None) -> np.ndarray:
     if depth_source.get("kind") != "zarr":
         raise ValueError(f"Unsupported depth source: {depth_source.get('kind')}")
     frame_id = int(frame_id)
     if frame_id < 0 or frame_id >= int(depth_source["frame_count"]):
         raise IndexError(f"Depth frame {frame_id} out of range {depth_source['frame_count']}")
-    depth = np.asarray(depth_source["array"][frame_id], dtype=np.float32)
-    depth = depth * float(unit_scale)
-    depth[depth <= 0.0] = np.nan
+    metadata = depth_source.get("depth_metadata")
+    if metadata is None:
+        metadata = resolve_depth_metadata(depth_source, unit_scale)
+    elif unit_scale is not None and not np.isclose(float(unit_scale), metadata["scale_to_m"], rtol=1e-9, atol=0):
+        raise DepthInputError("Per-read scale conflicts with configured depth scale")
+    cache = depth_source.get("decoded_cache")
+    read = lambda array: cache.read(array, frame_id) if cache is not None else np.asarray(array[frame_id])
+    raw = read(depth_source["array"])
+    # Compare sentinels before float32 conversion and before unit conversion.
+    sentinel = np.isin(raw, metadata["invalid_values_decoded"])
+    with np.errstate(over="ignore", invalid="ignore"):
+        depth = np.asarray(raw, dtype=np.float64) * metadata["scale_to_m"]
+        depth = depth.astype(np.float32)
+    cfg = depth_source.get("filter_config", {"min_m": DEPTH_MIN_M, "max_m": DEPTH_MAX_M})
+    finite_positive = np.isfinite(depth) & (depth > 0.0)
+    in_range = finite_positive.copy()
+    if cfg.get("min_m") is not None:
+        in_range &= depth >= cfg["min_m"]
+    if cfg.get("max_m") is not None:
+        in_range &= depth <= cfg["max_m"]
+    valid = in_range & ~sentinel
+    stats = {"total_pixels": int(depth.size), "invalid_or_nonpositive_pixels": int((~finite_positive).sum()),
+             "out_of_range_pixels": int((finite_positive & ~in_range).sum()),
+             "invalid_sentinel_pixels": int(sentinel.sum())}
+    for name, array in depth_source.get("quality_arrays", {}).items():
+        values = read(array)
+        if name == "validity":
+            accepted = np.isfinite(values) & (values > 0)
+        elif name == "confidence":
+            accepted = np.isfinite(values) & (values >= cfg["confidence_min"])
+        else:
+            accepted = np.isfinite(values) & (values > cfg["min_disparity_px"])
+        stats[f"invalid_{name}_pixels"] = int((~accepted).sum())
+        valid &= accepted
+    stats["valid_pixels"] = int(valid.sum())
+    stats["rejected_pixels"] = int((~valid).sum())
+    depth_source.setdefault("filter_stats", {})[frame_id] = stats
+    depth[~valid] = np.nan
     return depth
 
 
@@ -257,6 +500,41 @@ def resolve_camera_stream_id(
     raise KeyError("No camera calibration entries found in calibration file.")
 
 
+def camera_intrinsics_row(
+    calibration: dict[str, Any], stream_id: str,
+) -> tuple[list[float], str]:
+    try:
+        camera = camera_calibration(calibration, stream_id)
+    except KeyError as exc:
+        raise ValueError(f"Camera {stream_id} has no calibration entry") from exc
+    geometry = camera.get("prepared_image_geometry") or camera
+    if not isinstance(geometry, Mapping):
+        raise ValueError(f"Camera {stream_id} has invalid prepared_image_geometry")
+    intr = geometry.get("intrinsics") or {}
+    if not isinstance(intr, Mapping):
+        raise ValueError(f"Camera {stream_id} intrinsics must be a mapping")
+    row = []
+    for key in ("fx", "fy", "cx", "cy"):
+        raw = intr.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Camera {stream_id} requires numeric {key}; got {raw!r}") from exc
+        if not np.isfinite(value) or (key in ("fx", "fy") and value <= 0):
+            raise ValueError(f"Camera {stream_id} has invalid {key}={raw!r}; focal lengths must be positive and all intrinsics finite")
+        row.append(value)
+    resolution = geometry.get("resolution")
+    if isinstance(resolution, Mapping):
+        resolution = [resolution.get("width"), resolution.get("height")]
+    try:
+        resolution = np.asarray(resolution, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Camera {stream_id} requires a positive [width, height] resolution") from exc
+    if resolution.shape != (2,) or not np.isfinite(resolution).all() or np.any(resolution <= 0):
+        raise ValueError(f"Camera {stream_id} requires a positive [width, height] resolution")
+    return row + resolution.tolist(), "prepared_image_geometry" if geometry is not camera else "camera"
+
+
 def write_intrinsics(
     calibration: dict[str, Any],
     stream_id: str,
@@ -265,20 +543,31 @@ def write_intrinsics(
 ) -> dict[str, Any]:
     if timestamps_txt is None:
         raise ValueError("--intrinsics-out requires --timestamps-txt")
-    camera = camera_calibration(calibration, stream_id)
-    geometry = camera.get("prepared_image_geometry") or camera
-    intr = geometry.get("intrinsics") or {}
-    resolution = geometry.get("resolution")
-    if isinstance(resolution, Mapping):
-        resolution = [resolution["width"], resolution["height"]]
-    resolution = np.asarray(resolution, dtype=np.float64)
-    if resolution.shape != (2,) or not np.isfinite(resolution).all() or np.any(resolution <= 0):
-        raise ValueError(f"Camera {stream_id} requires a positive [width, height] resolution")
-    row = [float(intr[k]) for k in ("fx", "fy", "cx", "cy")]
-    row.extend(resolution.tolist())
     frame_count = len(read_timestamps(timestamps_txt))
     if frame_count <= 0:
         raise ValueError(f"No timestamps found: {timestamps_txt}")
+    try:
+        row, source = camera_intrinsics_row(calibration, stream_id)
+    except ValueError as exc:
+        # RGB-only episodes can contain placeholder calibration. Keep the
+        # upstream per-frame intrinsics, including their source resolution.
+        try:
+            existing = np.loadtxt(out, dtype=np.float64, ndmin=2)
+        except (OSError, ValueError) as fallback_exc:
+            raise ValueError(f"{exc}; no usable upstream intrinsics at {out}: {fallback_exc}") from exc
+        if (existing.shape != (frame_count, 6) or not np.isfinite(existing).all()
+                or np.any(existing[:, :2] <= 0) or np.any(existing[:, 4:] <= 0)):
+            raise ValueError(f"{exc}; upstream intrinsics at {out} require {frame_count} finite "
+                             "fx fy cx cy source_width source_height rows with positive focal lengths/resolution") from exc
+        print(f"[Real sensor] {exc}; keeping upstream intrinsics: {out}", flush=True)
+        return {
+            "stream_id": stream_id,
+            "status": "kept",
+            "source": "existing_intrinsics",
+            "reason": "invalid_camera_calibration",
+            "calibration_error": str(exc),
+            "frame_count": frame_count,
+        }
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(
         out,
@@ -288,7 +577,7 @@ def write_intrinsics(
     )
     return {
         "stream_id": stream_id,
-        "source": "prepared_image_geometry" if geometry is not camera else "camera",
+        "source": source,
         "intrinsics": dict(zip(("fx", "fy", "cx", "cy"), row[:4])),
         "resolution": dict(zip(("width", "height"), row[4:])),
     }
@@ -852,6 +1141,35 @@ def robust_spread(values: np.ndarray) -> float:
     return 1.4826 * mad
 
 
+def sparse_height_peaks(heights: np.ndarray, bin_width: float, block_bins: int,
+                        min_support: int) -> tuple[list[float], int]:
+    """3cm bins without allocating the empty space between near/far surfaces.
+
+    Storage is O(input points), never O(height span). Peak lookup is processed
+    in bounded blocks; isolated extreme heights cannot move other bin centers.
+    The caller rejects numerically unrepresentable bin indices first.
+    """
+    ids, counts = np.unique(np.floor(heights / bin_width).astype(np.int64), return_counts=True)
+
+    def lookup(query):
+        pos = np.searchsorted(ids, query)
+        safe = np.minimum(pos, len(ids) - 1)
+        return np.where((pos < len(ids)) & (ids[safe] == query), counts[safe], 0)
+
+    # A smoothed peak can also fall into an empty bin between occupied bins.
+    queries = np.unique(np.concatenate((ids - 1, ids, ids + 1)))
+    peaks = []
+    for start in range(0, len(queries), block_bins):
+        q = queries[start:start + block_bins]
+        m2, m1, mid, p1, p2 = [lookup(q + offset) for offset in (-2, -1, 0, 1, 2)]
+        center = m1 + 2 * mid + p1
+        left = m2 + 2 * m1 + mid
+        right = mid + 2 * p1 + p2
+        eligible = (center >= left) & (center > right) & (m2 + m1 + mid + p1 + p2 >= min_support)
+        peaks.extend((q[eligible].astype(np.float64) + .5) * bin_width)
+    return peaks, int(len(ids))
+
+
 def detect_floor_candidates_along_gravity(
     points_world: np.ndarray,
     up: np.ndarray,
@@ -861,6 +1179,9 @@ def detect_floor_candidates_along_gravity(
     min_coverage_m2: float = FLOOR_MIN_COVERAGE_M2,
     max_residual: float = FLOOR_MAX_RESIDUAL,
     max_height_rank: float = FLOOR_MAX_HEIGHT_RANK,
+    max_abs_height_m: float | None = FLOOR_MAX_ABS_HEIGHT_M,
+    max_histogram_bins: int = FLOOR_MAX_HISTOGRAM_BINS,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Find plausible floor levels in one depth frame.
 
@@ -875,49 +1196,59 @@ def detect_floor_candidates_along_gravity(
     if len(points_world) < int(min_support):
         return []
 
-    up = up / max(float(np.linalg.norm(up)), 1e-12)
+    if (max_abs_height_m is not None and (not np.isfinite(max_abs_height_m) or max_abs_height_m <= 0)) or max_histogram_bins < 3:
+        raise ValueError("Invalid floor histogram safety limits")
+    if not np.isfinite(height_bin) or height_bin <= 0:
+        raise ValueError("Invalid floor histogram bin width")
+    bin_width = max(float(height_bin), 1e-3)
+    up = np.asarray(up, dtype=np.float64)
+    if not np.isfinite(up).all() or np.linalg.norm(up) <= 1e-12:
+        raise ValueError("Invalid gravity-up vector")
+    up = up / np.linalg.norm(up)
     heights = points_world @ up
-    heights = heights[np.isfinite(heights)]
+    valid_height = np.isfinite(heights)
+    if max_abs_height_m is not None:
+        valid_height &= np.abs(heights) <= max_abs_height_m
+    # Pure numerical guard: preserve enough precision to resolve neighboring
+    # bins and convert to int64, not an indoor/outdoor distance assumption.
+    representable = np.abs(heights) <= (2**50) * bin_width
+    if diagnostics is not None:
+        diagnostics["height_range_rejected_points"] = int((~valid_height).sum())
+        diagnostics["numerical_resolution_rejected_points"] = int((valid_height & ~representable).sum())
+    valid_height &= representable
+    points_world = points_world[valid_height]
+    heights = heights[valid_height]
     if len(heights) < int(min_support):
         return []
 
-    bin_width = max(float(height_bin), 1e-3)
-    hmin = float(heights.min())
-    hmax = float(heights.max())
-    span = hmax - hmin
-    if span <= bin_width:
-        bins = np.array([hmin - 0.5 * bin_width, hmax + 0.5 * bin_width], dtype=np.float64)
-    else:
-        bins = np.arange(hmin - 0.5 * bin_width, hmax + bin_width, bin_width)
-        if bins[-1] <= hmax + 0.5 * bin_width:
-            bins = np.append(bins, bins[-1] + bin_width)
-
-    counts, edges = np.histogram(heights, bins=bins)
-    if counts.size < 3:
-        peak_indices = [int(np.argmax(counts))]
-    else:
-        smoothed = np.convolve(counts.astype(np.float64), np.array([1.0, 2.0, 1.0]), mode="same")
-        peak_indices = []
-        for idx in range(smoothed.size):
-            left = smoothed[idx - 1] if idx > 0 else -np.inf
-            right = smoothed[idx + 1] if idx + 1 < smoothed.size else -np.inf
-            if smoothed[idx] >= left and smoothed[idx] > right:
-                peak_indices.append(int(idx))
-        if not peak_indices:
-            peak_indices = [int(np.argmax(smoothed))]
-        peak_indices.sort(key=lambda i: float(counts[i]), reverse=True)
+    peak_levels, occupied_bins = sparse_height_peaks(heights, bin_width, int(max_histogram_bins), int(min_support))
+    if diagnostics is not None:
+        diagnostics.update(histogram_mode="sparse_occupied_bins", histogram_bins=occupied_bins,
+                           peak_lookup_block_bins=int(max_histogram_bins), initial_clusters=len(peak_levels))
 
     u_axis, v_axis = make_plane_basis(up)
     candidates: list[dict[str, Any]] = []
-    for peak_idx in peak_indices:
-        level = 0.5 * float(edges[peak_idx] + edges[peak_idx + 1])
+    for level in peak_levels:
         inlier = np.abs(heights - level) <= 1.5 * bin_width
         support = int(np.count_nonzero(inlier))
         if support < int(min_support):
             continue
 
         P_in = points_world[inlier]
-        residual = robust_spread(P_in @ up - level)
+        # Form the local horizontal-depth cluster FIRST, then trim outliers
+        # inside it. Do not apply a whole-scene percentile to different planes.
+        cluster_heights = heights[inlier]
+        median_height = float(np.median(cluster_heights))
+        trim_threshold = max(SCALE_OUTLIER_MAD * robust_spread(cluster_heights), .1 * bin_width)
+        keep = np.abs(cluster_heights - median_height) <= trim_threshold
+        rejected = int((~keep).sum())
+        P_in = P_in[keep]
+        cluster_heights = cluster_heights[keep]
+        support = int(len(P_in))
+        if support < int(min_support):
+            continue
+        level = float(np.median(cluster_heights))
+        residual = robust_spread(cluster_heights - level)
         if not np.isfinite(residual) or residual > float(max_residual):
             continue
 
@@ -948,9 +1279,13 @@ def detect_floor_candidates_along_gravity(
             "residual": residual,
             "height_rank": height_rank,
             "score": float(score),
+            "cluster_outliers_removed": rejected,
+            "cluster_trim_threshold_m": float(trim_threshold),
         })
 
     candidates.sort(key=lambda c: float(c["score"]), reverse=True)
+    if diagnostics is not None:
+        diagnostics["qualified_clusters"] = len(candidates)
     return candidates
 
 
@@ -959,6 +1294,7 @@ def select_largest_median_scale_cluster(
     *,
     relative_tolerance: float = DEPTH_SCALE_CLUSTER_REL_TOL,
     min_support_frames: int = DEPTH_SCALE_MIN_SUPPORT_FRAMES,
+    diagnostics: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Select the largest median implied-scale cluster among qualified floors.
 
@@ -1051,6 +1387,9 @@ def select_largest_median_scale_cluster(
     eligible_indices = [
         index for index, cluster in enumerate(clusters) if bool(cluster["eligible"])
     ]
+    if diagnostics is not None:
+        diagnostics.update(clusters=clusters, num_clusters=len(clusters),
+                           num_valid_candidate_records=len(valid))
     if not eligible_indices:
         raise ValueError(
             f"No qualified implied-scale cluster meets {min_support_frames} distinct supporting frames"
@@ -1112,6 +1451,8 @@ def robust_scale_from_matched_frames(records: list[dict[str, Any]]) -> tuple[flo
         "relative_mad": float(mad / max(abs(med), 1e-12)),
         "min": float(np.min(scales)),
         "max": float(np.max(scales)),
+        "inlier_pose_indices": [int(r["pose_index"]) for r, accepted in zip(
+            [r for r in records if np.isfinite(r.get("scale"))], keep) if accepted],
     }
 
 
@@ -1175,13 +1516,43 @@ def write_real_depth_scale(root: Path, segment: dict[str, Any], calibration: dic
                 json.dump(payload, f, ensure_ascii=False, indent=2)
         return payload
 
-    payload = write_real_depth_scale_from_floor(root, segment, calibration, args)
+    try:
+        payload = write_real_depth_scale_from_floor(root, segment, calibration, args)
+    except DepthInputError as exc:
+        payload = dict(status="failed", reason="unsafe_depth_input", scale=None,
+                       source="real_depth", error=str(exc))
+    payload["floor_depth_summary"] = summarize_floor_depth(payload)
 
     if args.scale_json is not None:
         args.scale_json.parent.mkdir(parents=True, exist_ok=True)
         with args.scale_json.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
     return payload
+
+
+def summarize_floor_depth(payload: dict[str, Any]) -> dict[str, Any]:
+    """Report perpendicular camera-to-plane distance, never label failed candidates ground truth."""
+    candidates = [dict(pose_index=frame["pose_index"],
+                       depth_frame_id=frame.get("matched_depth_frame_id"),
+                       distance_m=float(c["real_camera_height"]),
+                       implied_scale=float(c["implied_scale"]))
+                  for frame in payload.get("frames", []) for c in frame.get("candidates", [])
+                  if np.isfinite(c["real_camera_height"]) and c["real_camera_height"] > 0]
+    trusted = payload.get("status") == "ok"
+    inlier_ids = set(payload.get("scale_info", {}).get("inlier_pose_indices", []))
+    accepted = [float(r["real_camera_height"]) for r in payload.get("matched_frames", [])
+                if r["pose_index"] in inlier_ids] if trusted else []
+    return {
+        "definition": "perpendicular_camera_to_candidate_plane_distance_along_gravity_not_optical_Z",
+        "ground_evidence_trusted": trusted,
+        "semantic_ground_verified": False,
+        "trusted_distance_median_m": float(np.median(accepted)) if accepted else None,
+        "trusted_distance_min_m": float(np.min(accepted)) if accepted else None,
+        "trusted_distance_max_m": float(np.max(accepted)) if accepted else None,
+        "candidate_count": len(candidates),
+        "unverified_candidates": candidates if not trusted else [],
+        "reason": payload.get("reason"),
+    }
 
 
 def compact_summary_for_stdout(summary: dict[str, Any], detail_path: Path | None) -> dict[str, Any]:
@@ -1243,6 +1614,12 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
 
     depth_stream = stream_by(segment, stream_id=args.camera_stream_id)
     depth_source = open_depth_frames(root, depth_stream)
+    filter_config = configure_depth_filter(depth_source, args)
+    io_info = configure_depth_io(depth_source, args)
+    floor_limits = {
+        "max_abs_height_m": getattr(args, "floor_max_abs_height_m", FLOOR_MAX_ABS_HEIGHT_M),
+        "max_histogram_bins": int(getattr(args, "floor_max_histogram_bins", FLOOR_MAX_HISTOGRAM_BINS)),
+    }
     depth_frame_count = int(depth_source["frame_count"])
     depth_source_info = {
         "kind": depth_source["kind"],
@@ -1284,7 +1661,7 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
             aligned_height = float(np.asarray(head_poses[pose_index][:3, 3], dtype=np.float64) @ up)
             if not np.isfinite(aligned_height) or aligned_height <= 1e-8:
                 return None
-            candidates = detect_floor_candidates_along_gravity(points_cam, up_cam)
+            candidates = detect_floor_candidates_along_gravity(points_cam, up_cam, **floor_limits)
             if not candidates:
                 return None
             best = None
@@ -1346,8 +1723,11 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
             frame["depth_finite_pixels"] = int(np.isfinite(depth_real).sum())
             frame["backprojected_points"] = int(len(points_cam))
             frame["matched_depth_frame_id"] = int(matched_depth_frame_id)
+            frame["depth_filter"] = depth_source["filter_stats"][int(matched_depth_frame_id)]
+            frame["floor_histogram"] = {}
 
-            candidates = detect_floor_candidates_along_gravity(points_cam, up_cam)
+            candidates = detect_floor_candidates_along_gravity(
+                points_cam, up_cam, diagnostics=frame["floor_histogram"], **floor_limits)
             if not candidates:
                 frame["reason"] = "no_floor_candidate"
                 frames.append(frame)
@@ -1374,6 +1754,8 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
                     "real_camera_height": real_camera_height,
                     "implied_scale": implied_scale,
                     "selected_scale_cluster": False,
+                    "cluster_outliers_removed": int(candidate["cluster_outliers_removed"]),
+                    "cluster_trim_threshold_m": float(candidate["cluster_trim_threshold_m"]),
                 }
                 frame_candidates.append(candidate_info)
                 if np.isfinite(implied_scale) and implied_scale > 0.0:
@@ -1406,6 +1788,9 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
     base_inputs = {
         "episode_dir": str(root),
         "depth_source": depth_source_info,
+        "depth_filter": filter_config,
+        "depth_io": io_info,
+        "floor_histogram_limits": floor_limits,
     }
     num_frames_with_candidates = len({int(record["pose_index"]) for record in candidate_records})
     if num_frames_with_candidates < FLOOR_MIN_VALID_FRAMES:
@@ -1449,15 +1834,19 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
     local_window = max(1, int(args.depth_scale_local_window))
     min_local_support = max(1, int(args.depth_scale_local_min_support_frames))
     local_log_tol = float(np.log1p(float(args.depth_scale_cluster_rel_tol)))
+    local_verification_attempts = []
 
     while remaining_candidate_records:
+        clustering_diagnostics = {}
         try:
             selected_records, candidate_cluster_info = select_largest_median_scale_cluster(
                 remaining_candidate_records,
                 relative_tolerance=float(args.depth_scale_cluster_rel_tol),
                 min_support_frames=int(args.depth_scale_min_support_frames),
+                diagnostics=clustering_diagnostics,
             )
         except ValueError as exc:
+            cluster_info.update(clustering_diagnostics)
             cluster_info["selection_policy"] = "largest_median_implied_scale_cluster_locally_verified"
             cluster_info["reason"] = f"implied_scale_clustering_failed: {exc}"
             break
@@ -1485,6 +1874,9 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
                 eval_raw=eval_raw,
             )
             local_support.update(seed_support)
+            local_verification_attempts.append({"target_scale": target_scale, "seed_depth_frame_id": int(seed_id),
+                                                "support_frames": sorted(int(i) for i in merged_ids),
+                                                "required_support_frames": min_local_support})
             if len(merged_ids) >= min_local_support:
                 verified = True
                 verified_seed_id = int(seed_id)
@@ -1524,7 +1916,7 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
     if not selected_cluster_records:
         return {
             "status": "failed",
-            "reason": "no_scale_candidate_verified_locally",
+            "reason": "no_scale_candidate_verified_locally" if local_verification_attempts else "no_scale_cluster_with_enough_frames",
             "scale": None,
             "source": "real_depth",
             "scale_method": "depth_floor_implied_scale_cluster",
@@ -1532,6 +1924,7 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
             "num_frames_with_candidates": int(num_frames_with_candidates),
             "num_candidate_records": int(len(candidate_records)),
             "cluster": cluster_info,
+            "local_verification_attempts": local_verification_attempts,
             "elapsed_sec": round(time.time() - started, 3),
             "inputs": base_inputs,
             "frames": frames,
@@ -1638,7 +2031,7 @@ def write_real_depth_scale_from_floor(root: Path, segment: dict[str, Any], calib
         "elapsed_sec": round(time.time() - started, 3),
         "config": {
             "camera_stream_id": args.camera_stream_id,
-            "depth_unit_scale": float(args.depth_unit_scale),
+            "depth_unit_scale": float(io_info["scale_to_m"]),
             "num_samples": int(args.num_samples),
             "depth_scale_local_window": int(args.depth_scale_local_window),
             "depth_scale_local_min_support_frames": int(args.depth_scale_local_min_support_frames),

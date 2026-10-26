@@ -3,30 +3,146 @@
 本项目的 `scripts` 目录是一个“上游检测产物 -> 对齐/配准 -> 估计 -> 生成轨迹与人体网格” 的完整流水线。
 主入口为 `scripts/run_body_mesh.py`，其它脚本基本都是它的子步骤。
 
+## 人体头部轨迹输入
+
+人体头部轨迹固定读取 `assets/poses/camera_30fps.parquet`，经原有场景对齐与尺度处理后，
+写入 `egoallo_inputs/head_trajectory.npy`。姿态校验、EgoGVAE 和 EgoAllo
+共用原有输入；头部轨迹不再读取 `camera.parquet` 进行专用补帧，也不使用 IMU 辅助头部插值。
+
+首个相机姿态用于构造运动差分，N 帧相机输入输出 N-1 帧人体。NPZ 中
+`frame_nums` 是从 0 开始的运动索引，首个运动姿态对应相机第 1 行；
+与 RGB、手、物体对齐应使用 `timestamps` / `timestamps_ns`，不要直接比较这两个帧号。
+
+IMU 重力/地面对齐、真实深度尺度估计以及地面估计失败时跳过尺度/人体并写空 NPZ
+的规则保持不变。历史 `body_imu` 目录和补帧报告不会被新运行读取，也不再生成。
+
+回归测试：`python -B -m unittest discover -s tests -v`。
+
+## CPU 线程与等价计算优化
+
+`runtime.preprocess_threads: 1` 设置预处理子进程的 CPU 数值库线程默认值，
+显式设置的 `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` 等仍优先。
+`runtime.torch_cpu_threads: 1` 仅在模型的 CPU 构造、CPU FK、选窗和旋转导出期间
+临时设置 PyTorch intra-op 线程，退出作用域后恢复原值。两项设为 `0` 可关闭对应线程设置，
+环境变量 `EGO_UNI_PREPROCESS_THREADS` / `EGO_UNI_TORCH_CPU_THREADS` 可覆盖配置。
+
+选窗阶段按重叠窗口对批量计算并复用代价，保留原有浮点类型、累加顺序、门限回退和选路规则。
+手部检测计数仅检查时间索引，避免为计数复制全部顶点；实际分段复制使用 CPU 线程作用域，
+恢复线程后再将原样保留的检测数据传到 GPU。
+接地与腿部求解器复用固定几何量和相同体型张量，保留迭代数、损失与 CUDA 精度设置。
+选窗代价缓存随帧数和同时覆盖窗口数的平方增长；默认 `window_size=128`、`window_stride=32`。
+相关回归：`python -m pytest tests/test_runtime_threads.py tests/test_selection_cost_cache.py tests/test_hamer_segment_threads.py`。
+
+性能对照保留在 `benchmarks/perf_optimization_20261015/`，包含修改前脚本快照、运行配置、
+逐次日志、20 毫秒显存采样与结果比较。JAX 缓存应使用固定目录；当前 JAX 会将 autotune
+目录路径计入编译键，复制缓存到不同路径不能保证命中。首次编译耗时应与热缓存运行分别报告。
+
+`jax_guidance.compilation_cache.prewarm_guidance` 默认 `true`，`warmup_mode` 默认 `compile`。
+预热使用原 JAX 函数的 `lower(...).compile()` 提前构图并加载或编译 inner/post 执行程序，
+保留原输入结构、浮点类型、固定桶和所有正式求解预算，不执行虚拟姿态优化。
+磁盘缓存命中后仍需要 tracing、构图和反序列化，因此预热不是零开销。
+此接口位于 `../exp/egoallo/src/egoallo/guidance_optimizer_jax.py` 和 `sampling.py`；
+迁移项目时需要同时携带这两处依赖改动。
+
+参考项目 `../zata-model/ego-pose-project` 使用的旧预热会用零体型、单位旋转构造姿态，
+额外运行 inner/post 求解并丢弃结果，命中磁盘缓存后仍可能耗时数分钟。
+诊断旧行为可设 `warmup_mode: solve`，或直接给 07 脚本传 `--guidance-warmup-mode solve`。
+设 `prewarm_guidance: false`（07 参数 `--skip-guidance-prewarm`）则完全跳过提前准备，
+由首次正式调用加载或编译。三个模式均保留正式推理算法和精度配置，但不承诺 CUDA 逐位一致；
+腿部后处理对微小输入差异敏感，数值比较应同时检查原始推理结果和最终动作。
+episode_003 对照中，仅编译预热为 32.86 秒，完整 07 阶段为 67.03 秒；用户旧运行分别为
+410.65/440.85 秒，旧方式独立重跑为 216.65/248.60 秒。三次均实际命中 8 个缓存请求。
+旧方式重跑相对用户结果的最终最大关节差为 3.53°，仅编译方式为 3.62°；原始关节差分别
+仅为 0.000146°/0.000164°。这说明原流程也存在重跑差异，不应把最终差异都归因于预热方式。
+这些是输出间差异，不是有真值标注的精度误差；验证记录见
+`diagnostics/jax_compile_prewarm_20261015/RESULTS.txt`。
+新的 `[JAX CACHE] source=jax.monitoring` 日志及报告 `jax_cache_events` 记录实际缓存请求、
+命中和加载耗时；`miss_writes` 是缓存未命中后写入的次数。旧 `persistent_cache_reuse_likely`
+仅根据目录文件数和字节数推测，不应当作实际命中证明，`warmup_finished` 也不是纯编译时间。
+
+## Episode RGB 抽帧
+
+从 episode 的 `camera_left.mp4`（或选中的 RGB 流）抽帧时，使用 RGB 流
+`origin.sample_map_uri` 指向的 sample map。downstream 相机表的 `frame_id`
+对应 sample map 的 `output_frame_index`，该索引就是 prepared MP4 的本地帧号。
+`timestamp_ns` 保持原值，并与 sample map 的 `output_timestamp_ns` 做一致性校验，
+不再用 episode 时间戳反推视频帧号，也不使用原始视频的 `source_frame_idx`。
+这样可以保留 prepared episode 的首帧时间偏移，例如 demo9 的 episode_004 首帧时间为
+20.333333ms，但视频本地首帧仍然是索引 0。
+
+要求 RGB 流声明固定帧率 `sampling: cfr`、`clock_id: episode`，实际视频帧率与元数据一致，
+sample map 的 `output_frame_index` 连续且数量与视频帧数一致。抽样前会验证全部相机行的
+frame ID、时间戳和 sample map 是否一致。缺少 sample map、帧数不一致或时间戳不一致时会明确报错。
+相机的处理帧号、时间戳和原始帧号在输出中保持不变，图像仍以处理帧号命名。
+
+遇到非固定帧率、未知时钟、非法时间或越界会明确报错，不会自动退回原始/segment/处理帧号。
+此改动仅针对 RGB，不修改深度帧匹配与尺度逻辑。
+
+## 深度过滤与参考对齐降级
+
+`episode.json` 中的 `camera_ego_depth` 可能使用 `centerdepth.log_sz3.v1`。
+这是 `zpds-depth-cp` 注册的 Zarr v2 codec；运行真实深度流程前需要在同一个 Python
+环境安装它及其 `pysz` 依赖：
+
+```bash
+python -m pip install "git+https://github.com/happy-coder-yhy/zpds-depth-cp.git@main"
+```
+
+读取器会在 `zarr.open` 前导入 `zpds_depth_cp` 完成 codec 注册。若缺少该包，流程会
+明确报错，而不会把压缩块当作普通 Zarr/float32 数据读取。
+
+深度与质量掩码按时间 chunk 对齐读取完整图像块，共用已解压 LRU 缓存；
+`real_sensor.depth_cache_mb` 默认 512 MiB，命中期间不重复解压同一块。
+缓存超过预算时淘汰旧块；一个活动深度/质量块集合就超过预算时，在读取前拒绝，
+报告增加预算或上游重分块，避免回到逐帧反复解压。此上限不包括 codec 临时内存。
+
+`depth_unit_scale: null` 自动读取 episode stream、Zarr 根组和数组属性中的
+`depth_unit/unit/units`（米、厘米、毫米）；声明或显式倍率冲突时拒绝尺度估计，
+缺少单位时要求显式配置，不按数值猜单位。Zarr codec 的 storage scale 已在读取时解码，
+不会重复乘除。合并属性 `invalid_depth_value(s)/_FillValue/missing_value` 与
+`depth_invalid_values`，在换算米之前过滤特殊无效值（仅声明/配置后才过滤 65535）。
+输入不安全时报告 `unsafe_depth_input` 并进入参考对齐/空人体降级。
+报告 `inputs.depth_io` 包含单位来源、无效值、chunk 形状及缓存命中/读取/内存统计。
+
+真实深度默认抽样 96 帧。`real_sensor.depth_min_m/depth_max_m` 与
+`depth_floor_max_abs_height_m` 默认 `null`，不假设室内或室外测距范围；已知设备范围时
+可显式填写。先过滤非有限/非正深度及显式配置的 Zarr validity、confidence、disparity
+掩码，再按重力高度形成水平面候选簇，在每个簇内按中位数/MAD 剔除异常点。
+高度直方图只存非空桶，保持 3cm 桶宽，峰值查询每块最多
+`depth_floor_max_histogram_bins`（默认4096）桶；内存随点数而非深度跨度增长。
+平面支撑/覆盖率和跨帧尺度一致性验证仍保留；候选簇不等于语义地面。
+`real_depth_scale_estimate.json` 中 `floor_depth_summary` 区分沿重力方向的相机到平面
+距离与光轴深度；验证失败时可信距离为 `null`，候选距离单独列出，不能当真实地面使用。
+
+IMU 地面对齐失败，或真实深度无法建立一致的地面尺度时，不再中断场景导出。
+保留现有刚体显示变换和输入尺度，所有点云、头、手和物体使用同一坐标系；
+标记 `reference_only=true`、`ground_plane_trusted=false`、`metric_scale_trusted=false`，
+输出单位标为 `input_units`，跳过人体校验/推理并写空人体 NPZ。
+此降级不证明检测到了语义上的真实地面，也不恢复 IMU 辅助头部插值。
+
 ## 一、入口与输入
 
 ### 1.1 主入口
 
 ```bash
-python /home/xieyongling/slam_project/ego-pose-project/scripts/run_body_mesh.py \
-  --config /home/xieyongling/slam_project/ego-pose-project/config/body_mesh.yaml \
-  --frames-dir /path/to/frames \
-  --cam-space-dir /path/to/cam_space \
-  --hawor-hands-vggt-world /path/to/hawor_hands.jsonl \
-  --hawor-to-vggt-alignment /path/to/hawor_to_vggt_alignment.json \
-  --vggt-head-pose /path/to/vggt_head_pose.jsonl \
-  --scene-points-ply /path/to/scene_points.ply \
+conda run -n ego_fa_env python scripts/run_body_mesh.py \
+  --config config/body_mesh.yaml \
+  --episode-dir /path/to/episode_001 \
+  --downstream-dir /path/to/episode_001/assets \
   --output-dir /path/to/output
 ```
 
-必填输入：
-- `frames-dir`：原视频抽帧图像目录
-- `cam-space-dir`：双目/多目 `cam_space` 目录
-- `hawor-hands-vggt-world`：HaWoR 手关键点
-- `hawor-to-vggt-alignment`：对齐矩阵 json
-- `vggt-head-pose`：VGGT 头部姿态 jsonl
-- `scene-points-ply`：场景点云
-- `config/body_mesh.yaml`：全局参数
+入口接收 episode 和上游 assets 目录，内部生成抽帧、JSONL 和 HaMeR 约束；
+旧的 `--frames-dir`、`--cam-space-dir` 等参数已不再是入口参数。
+
+- `episode-dir`：`episode.json` 及其引用的 RGB、标定、IMU、深度等文件。
+- `downstream-dir`：含 `manifest.json` 的上游 assets 目录；需要
+  `poses/camera_30fps.parquet`、`poses/hands_30fps.parquet`，以及 manifest 指向的
+  alignment 和 static_pointcloud。原始 `poses/camera.parquet` 提供
+  `poses/cam_space/0`、`1` 中 MANO 参数的采样时间轴，用于将参数插值到 30 FPS。
+  物体导出使用 `poses/objects_30fps.parquet` 及 manifest 中的物体网格。
+- `output-dir`：输出目录；独立测试建议使用新目录。
+- `config`：全局参数和本地模型路径。
 
 ### 1.2 插件入口
 
@@ -35,6 +151,16 @@ python /home/xieyongling/slam_project/ego-pose-project/scripts/run_body_mesh.py 
 会直接调用上述 `run_body_mesh.py`。
 
 ## 二、执行流程（run_body_mesh）
+
+EgoAllo 手部约束与前端显示统一读取上游 `assets/poses/hands_30fps.parquet`：
+
+- runner 将该文件转换出的原始密集 JSONL 直接传给 04 构造 HaMeR 约束，
+  不经过 02/03 的连续段筛选、平滑或补帧，也不再次插值上游手关键点。
+- 前端 `assets/poses/hand_keypoints_egoallo.parquet` 同样使用这份上游 30 FPS 手数据，
+  再应用统一的场景对齐与手几何尺度。
+- `cam_space/0`、`1` 中的 MANO 参数按原始 `camera.parquet` 的时间轴解释，
+  再插值到 30 FPS 目标时间；不能把原始采样帧号直接当成 30 FPS 帧号。
+- 02/03 保留用于尺度估计的手部预处理，其结果不作为 EgoAllo 或前端的手关键点输入。
 
 `run_body_mesh.py` 串联以下脚本（依次执行）：
 
@@ -45,16 +171,18 @@ python /home/xieyongling/slam_project/ego-pose-project/scripts/run_body_mesh.py 
    - `tmp/intrinsics.txt`
 
 2. `02_extract_hawor_world_hands.py`
-   HaWoR 手检测预处理，加入权重/软起止策略。
+   为尺度估计预处理 HaWoR 手检测，加入权重/软起止策略。
 
 3. `03_stabilize_hawor_hands_for_egoallo.py`
-   稳定手部轨迹（去抖/去抖动跳变）。
+   稳定尺度估计使用的手部轨迹（去抖/去抖动跳变）。
 
 4. `extract_hawor_to_vggt_rotation.py`
    读对齐 json，产出 `tmp/R_hawor_to_vggt.npy`。
 
 5. `04_build_egoallo_hamer_from_hawor_world.py`
-   产出 `tmp/hamer_outputs.pkl`（EgoAllo 输入约束）。
+   直接读取上游 `hands_30fps.parquet` 转换出的原始密集 JSONL，并按原始相机
+   时间轴将 `cam_space` 的 MANO 参数插值到目标帧，产出
+   `tmp/hamer_outputs.pkl`（EgoAllo 输入约束）。02/03 的结果仅用于尺度估计。
 
 6. `run_geocalib.py`
    用样本帧跑 GeoCalib，产出 `tmp/geocalib_gravity.npz`。
@@ -98,10 +226,10 @@ python /home/xieyongling/slam_project/ego-pose-project/scripts/run_body_mesh.py 
    **有真实深度时改走 `04_prepare_real_sensor_inputs.py` 的重力约束地面尺度估计**，
    产出 `tmp/real_depth_scale_estimate.json`。流程：
 
-   1. 上游传入的 RGB/head trajectory 已经是 5FPS；这里只按
-      `real_sensor.depth_scale_num_samples` 均匀抽 pose（默认 64 帧），再按
-      `timestamps.txt` 的 **`src_frame_id`**（不是采样后的 `frame_id`）通过 depth sample map
-      找对应深度帧。
+   1. 当前人体输入使用 `camera_30fps.parquet`。这里只按
+      `real_sensor.depth_scale_num_samples` 均匀抽 pose（默认 96 帧）。当前深度
+      读取函数依次检查 `timestamps.txt` 的 `src_frame_id`、`frame_id`、pose 行号，
+      使用第一个位于深度数组范围内的索引；该路径不读取 depth sample map。
    2. 用真实标定内参将深度反投影为米制点，并通过 `depth_to_color` 外参转到 RGB
       相机系；把对齐阶段确定的世界 up 方向旋转到该帧相机系。
    3. 沿 up 方向寻找水平面候选，以点数、覆盖面积、残差和低处位置过滤单帧候选；
@@ -179,9 +307,9 @@ python /home/xieyongling/slam_project/ego-pose-project/scripts/run_body_mesh.py 
 - `output_layout.*`：各目录名与清理开关。
 
 ### 4.2 手部预处理
-- `hawor_extract.*`：提取阈值与平滑规则
-- `hawor_stabilize.*`：去抖动/分段边界参数
-- `hamer_build.*`：`cam_space` 子目录与 MANO 关键点 key 名
+- `hawor_extract.*`：尺度估计分支的提取阈值与平滑规则
+- `hawor_stabilize.*`：尺度估计分支的去抖动/分段边界参数
+- `hamer_build.*`：`cam_space` 子目录与 MANO 参数索引；按原始相机时间轴插值到 30 FPS
 
 ### 4.3 对齐与重力
 - `geocalib.*`：GeoCalib 抽样与采样策略
@@ -208,7 +336,7 @@ python /home/xieyongling/slam_project/ego-pose-project/scripts/run_body_mesh.py 
 - `egoallo_refine.egogvae_leg_pose_strength`：EgoGVAE 八个腿部局部旋转对每步 EgoAllo clean-pose 的软引导强度，范围 0～1，当前保守默认 0.10；设 0 只关闭姿态引导，仍强制使用新 sampler 接口。
 - `egoallo_refine.egogvae_leg_pose_max_step_deg`：每个 DDIM 步、每个腿关节最多朝参考旋转的角度；不是最终姿态替换。
 - `egoallo_refine.egogvae_leg_pose_release_last_steps`：最后若干 DDIM 步用 smoothstep 把引导降到 0，让 EgoAllo 自由完成末段微调。
-- `egoallo_refine.hand_refinement_max_deg`：单次肩肘修正上限，默认 2 度，范围 0～5，设 0 关闭。不是反复强拉腕点；腕部世界朝向保持不变。
+- `egoallo_refine.hand_refinement_max_deg`：单次肩肘修正上限，当前配置为 0（关闭），范围 0～5；腕部世界朝向保持不变。
 - 官方策略对照：腕部位置权重设 20，EgoGVAE 腿姿态强度、平滑上限、腿部迭代数、手部修正上限都设 0。
 - 当前流水线强制依赖 `patches/egoallo_body_pose_reference.patch` 扩展的 EgoAllo sampler；即使强度为 0，实际导入路径或接口不匹配也会直接报错，不兼容旧 sampler。
 - 没有动作真值时，“更接近 EgoGVAE”只表示先验确实生效，不等于更准确；应结合 HaWoR 手误差、穿地/脚滑、时序指标及固定相机并排视频验收。
@@ -229,6 +357,39 @@ python tests/run_egogvae_leg_pose_guidance_demos.py \
 baseline 的上半身/根节点变化；固定相机三路视频由
 `tests/render_egogvae_leg_pose_guidance.py` 生成。只有同一参数跨多个 demo 通过数值检查并完成人工
 视频审阅后，才应把 YAML strength 从 0 改为非零。
+
+### 4.8 避碰实验已移除
+
+额外手/人体避碰后处理及其 CLI、配置、锁手/连续性回退模块已删除。
+当前流程保留原有 EgoAllo 手部软约束、姿态平滑、接地和下肢稳定化。
+2026-10-15 demo7 三集实验中，穿透深度总和仅下降约 0.00513%，严重穿透未改善。
+历史测量与图像保留在 `tests/demo7_collision_ab_20261015/`；其中旧运行命令和配置
+是实验快照，不再代表当前入口，不能用于重新启用已移除的模块。
+新运行不再输出 `before_hand_collision.npz` 或避碰相关 NPZ/JSON 字段。
+
+### 4.9 手骨架与物体相对位置核查
+
+2026-10-15 的逐帧核查位于 `tests/demo7_hand_object_alignment_20261015/`。
+`assets/alignment.json` 的 `sim3.R` 是 HaWoR 相机到场景相机的列向量正向旋转；
+提取时直接使用，不能再转置。自动估计分支同样返回满足 `dst = src @ R.T` 的旋转。
+此前转置错误会使三集手部输入朝向分别偏差约 9.56、24.13、16.95 度，现已修复。
+
+手腕和手指局部旋转拟合准确，不代表 21 个手关键点空间位置一致：
+上游相似变换及度量尺度会缩放 MANO 手几何，而人体使用自己的 SMPL-H 形状与骨长。
+审计分别记录原始 5 Hz 保留观测、被过滤观测和 30 Hz 插值参考，并在同一物体局部坐标系比较。
+查看该目录的 `RESULTS.txt`、原始/修正后的审计 JSON 和关键帧图，不要只根据单个侧视投影判断接触。
+
+### 4.10 统一物体表面与手骨架的度量尺度
+
+物体位姿的平移与 canonical GLB 的局部几何都需要乘同一个 `metric_scale`。
+GLB 在物体局部原点缩放，包含所有场景节点的平移，随后再应用物体刚体位姿；
+不能只缩放物体平移，也不能额外乘仅用于 HaWoR 相机转换的 `alignment.sim3.scale`。
+`05_apply_metric_scale.py` 现已对 GLB 应用该尺度，并记录 `scale_applied` 和 `local_geometry_scale`。
+
+前端手关键点和可选手网格的局部尺寸使用与 HaMeR 输入相同的 `hand_geometry_scale`；
+demo7 的真实深度路径中，它等于场景度量尺度。场景相机、物体表面和手几何因此共享同一缩放。
+本次资产导出修复不改变人体推理输入，已生成的 NPZ 可与修正后的 GLB 配套使用。
+三集实际导出、逐帧接近距离和关键帧对比见 `tests/demo7_unified_scale_20261015/RESULTS.txt`。
 
 ## 五、常用排查点
 
